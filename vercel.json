@@ -4,6 +4,6 @@
     { "source": "/api/(.*)", "destination": "/api" }
   ],
   "crons": [
-    { "path": "/api/internal/cron/maintenance", "schedule": "00 * * * *" }
+    { "path": "/api/internal/cron/maintenance", "schedule": "0 0 * * *" }
   ]
 }
