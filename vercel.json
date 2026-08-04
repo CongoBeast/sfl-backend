@@ -1,47 +1,9 @@
 {
-  "version": 2,
-  "buildCommand": "npm run vercel-build",
-  "outputDirectory": "client/build",
-  "functions": {
-    "api/index.js": {
-      "maxDuration": 60,
-      "memory": 1024
-    }
-  },
-  "crons": [
-    {
-      "path": "/api/internal/cron/maintenance",
-      "schedule": "0 2 * * *"
-    }
-  ],
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
-    {
-      "source": "/api/:path*",
-      "destination": "/api/index"
-    },
-    {
-      "source": "/:path*",
-      "destination": "/index.html"
-    }
+    { "source": "/api/(.*)", "destination": "/api" }
   ],
-  "headers": [
-    {
-      "source": "/(.*)",
-      "headers": [
-        {
-          "key": "X-Content-Type-Options",
-          "value": "nosniff"
-        },
-        {
-          "key": "Referrer-Policy",
-          "value": "strict-origin-when-cross-origin"
-        },
-        {
-          "key": "Permissions-Policy",
-          "value": "camera=(), microphone=(), geolocation=()"
-        }
-      ]
-    }
-  ],
-  "installCommand": "npm install --legacy-peer-deps --no-audit --no-fund && npm install --prefix client --legacy-peer-deps --no-audit --no-fund"
+  "crons": [
+    { "path": "/api/internal/cron/maintenance", "schedule": "0 0 * * *" }
+  ]
 }
