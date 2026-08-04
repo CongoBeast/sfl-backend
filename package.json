@@ -1,34 +1,30 @@
 {
-  "name": "supreme-fantasy-league",
+  "name": "supreme-fantasy-league-api",
   "version": "1.0.0",
+  "description": "Supreme Fantasy League backend API (Express + MongoDB), packaged for Vercel serverless hosting.",
   "private": true,
+  "license": "UNLICENSED",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.x"
+  },
   "scripts": {
-    "dev": "concurrently \"npm run server:local\" \"npm run client\"",
-    "server:local": "node server.local.js",
-    "server": "node server.local.js",
-    "client": "npm start --prefix client",
-    "build": "npm ci --prefix client && npm run build --prefix client",
-    "vercel-build": "npm ci --prefix client && npm run build --prefix client",
-    "start": "node server.local.js",
-    "install-all": "npm ci && npm ci --prefix client"
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "vercel-dev": "vercel dev"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.21.1",
-    "express-rate-limit": "^7.4.1",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.2",
-    "mongoose": "^8.8.2",
-    "paynow": "^2.2.2",
-    "resend": "^6.18.1"
+    "mongoose": "^8.9.5"
   },
   "devDependencies": {
-    "concurrently": "^9.1.0"
-  },
-  "engines": {
-    "node": ">=20 <23"
+    "nodemon": "^3.1.7"
   }
 }
