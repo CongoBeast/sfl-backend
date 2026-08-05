@@ -15,7 +15,7 @@ function createLocalEmailService({
   normalizePaynowStatus,
 }) {
   const { Schema } = mongoose;
-  const EMAILS_ENABLED = String(process.env.EMAILS_ENABLED || 'true').trim().toLowerCase() !== 'false';
+  const EMAILS_ENABLED = String(process.env.EMAILS_ENABLED || 'false').trim().toLowerCase() === 'true';
   const RESENDER_API_KEY = String(process.env.RESENDER_API_KEY || '').trim();
   const SENDING_EMAIL = String(process.env.SENDING_EMAIL || '').trim();
   const ADMIN_NOTIFICATION_EMAIL = String(process.env.ADMIN_NOTIFICATION_EMAIL || '').trim().toLowerCase();

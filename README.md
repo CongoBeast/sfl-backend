@@ -95,7 +95,11 @@ Two things to know operationally:
    from `api/index.js`.
 2. Add the environment variables from `.env.example`. At minimum:
    `MONGO_URI`, `JWT_SECRET` (32+ characters in this version), and
-   `CLIENT_ORIGIN(S)` set to your actual frontend origin(s).
+   `CLIENT_ORIGIN(S)` set to your actual frontend origin(s). For this app, use
+   `CLIENT_ORIGIN=https://supremeleague.app` and include both the apex and
+   `www` domains in `CLIENT_ORIGINS` if both can serve the frontend. Set these
+   values for the Vercel **Production** environment, then redeploy; changing a
+   Vercel environment variable does not change an already-built deployment.
 3. Everything payments/email/fantasy-data-related defaults to mock/off —
    safe to deploy immediately without Paynow, Resend, or Cloudinary
    credentials.

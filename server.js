@@ -17,11 +17,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 8000);
 const COOKIE_NAME = process.env.COOKIE_NAME || 'sfl_session';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
-const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'http://localhost:3000';
-const CLIENT_ORIGINS = String(process.env.CLIENT_ORIGINS || CLIENT_ORIGIN)
-  .split(',')
-  .map((origin) => origin.trim().replace(/\/$/, ''))
-  .filter(Boolean);
+const { CLIENT_ORIGIN, CLIENT_ORIGINS, isAllowedOrigin } = require('./cors-config');
 const IS_PRODUCTION = String(process.env.NODE_ENV || '').trim().toLowerCase() === 'production';
 const IS_VERCEL = Boolean(process.env.VERCEL);
 const PAYMENTS_MODE = String(process.env.PAYMENTS_MODE || 'mock').trim().toLowerCase();
@@ -1141,8 +1137,7 @@ app.use(cors({
   origin(origin, callback) {
     // Requests without an Origin header include server-to-server callbacks and cron jobs.
     if (!origin) return callback(null, true);
-    const normalizedOrigin = origin.replace(/\/$/, '');
-    if (CLIENT_ORIGINS.includes(normalizedOrigin)) return callback(null, true);
+    if (isAllowedOrigin(origin)) return callback(null, true);
     const error = new Error('Origin is not allowed by CORS.');
     error.status = 403;
     return callback(error);
