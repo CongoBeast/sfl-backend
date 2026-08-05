@@ -1,7 +1,7 @@
 {
   "name": "supreme-fantasy-league-api",
   "version": "1.0.0",
-  "description": "Supreme Fantasy League backend API (Express + MongoDB), packaged for Vercel serverless hosting.",
+  "description": "Supreme Fantasy League backend API (Express + MongoDB + email notifications), packaged for Vercel serverless hosting.",
   "private": true,
   "license": "UNLICENSED",
   "main": "server.js",
