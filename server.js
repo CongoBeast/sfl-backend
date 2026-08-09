@@ -1163,7 +1163,7 @@ function setSessionCookie(res, token) {
   res.cookie(COOKIE_NAME, token, {
     httpOnly: true,
     secure: IS_PRODUCTION,
-    sameSite: IS_PRODUCTION ? 'none' : 'lax',
+    sameSite: 'lax',
     maxAge: 7 * 24 * 60 * 60 * 1000,
     path: '/',
   });
