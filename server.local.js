@@ -40,6 +40,11 @@ const SUBSCRIPTION_CHECK_INTERVAL_MS = Math.max(60000, Number(process.env.SUBSCR
 const SUBSCRIPTION_WALLET_SEED_CENTS = Math.max(0, Math.round(Number(process.env.SUBSCRIPTION_WALLET_SEED_CENTS || 0)));
 const FPL_DATA_MODE = String(process.env.FPL_DATA_MODE || 'mock').trim().toLowerCase();
 const MOCK_FANTASY = FPL_DATA_MODE === 'mock';
+// Local diagnostic only. Never enabled automatically and never runs inside Vercel.
+// When enabled, the local process checks Supreme league creation + subscription enrollment
+// once shortly after startup and then every 3 minutes.
+const LOCAL_LEAGUE_ENROLLMENT_TEST_CRON = String(process.env.LOCAL_LEAGUE_ENROLLMENT_TEST_CRON || 'false').trim().toLowerCase() === 'true';
+const LOCAL_LEAGUE_ENROLLMENT_TEST_INTERVAL_MS = 3 * 60 * 1000;
 const FPL_BASE_URL = String(process.env.FPL_BASE_URL || 'https://fantasy.premierleague.com/api').replace(/\/$/, '');
 const FPL_CACHE_MINUTES = Math.max(1, Math.min(60, Number(process.env.FPL_CACHE_MINUTES || 10)));
 const FPL_REQUEST_TIMEOUT_MS = Math.max(3000, Math.min(30000, Number(process.env.FPL_REQUEST_TIMEOUT_MS || 12000)));
@@ -1786,12 +1791,13 @@ async function processPaynowStatus(transaction, paynowData) {
 
 async function reconcilePendingPaynowPayments() {
   if (!PAYNOW_PAYMENTS) return;
+  // Reconcile every unresolved Paynow checkout, including transactions older than 48 hours.
+  // The previous age filter could leave an abandoned checkout permanently blocking wallet payment.
   const transactions = await Transaction.find({
     provider: 'paynow',
     status: { $in: ['pending', 'processing'] },
     'metadata.pollUrl': { $exists: true, $ne: '' },
-    createdAt: { $gte: new Date(Date.now() - 48 * 60 * 60 * 1000) },
-  }).sort({ updatedAt: 1 }).limit(25);
+  }).sort({ updatedAt: 1 }).limit(50);
   for (const transaction of transactions) {
     try {
       const status = await pollPaynowTransaction(transaction);
@@ -1800,6 +1806,43 @@ async function reconcilePendingPaynowPayments() {
       console.error('Paynow reconciliation failed', transaction.reference, error.message);
     }
   }
+}
+
+async function resolvePaynowBlockerBeforeWalletPurchase({ userId, type, planCode = '', leagueId = null }) {
+  const query = {
+    userId,
+    type,
+    provider: { $in: ['paynow', 'mock'] },
+    status: { $in: ['pending', 'processing'] },
+  };
+  if (planCode) query['metadata.planCode'] = planCode;
+  if (leagueId) query.leagueId = leagueId;
+
+  const candidates = await Transaction.find(query).sort({ createdAt: 1 }).limit(10);
+  for (let transaction of candidates) {
+    // Before blocking a wallet purchase, refresh the provider state synchronously.
+    // This clears checkouts that Paynow has already marked failed/cancelled and avoids
+    // making the user wait for the maintenance job.
+    if (
+      transaction.provider === 'paynow'
+      && PAYNOW_PAYMENTS
+      && transaction.metadata?.pollUrl
+      && ['pending', 'processing'].includes(transaction.status)
+    ) {
+      try {
+        const status = await pollPaynowTransaction(transaction);
+        if (status) transaction = await processPaynowStatus(transaction, status);
+      } catch (error) {
+        console.error('Paynow blocker refresh failed', transaction.reference, error.message);
+        transaction = await Transaction.findById(transaction._id);
+      }
+    }
+
+    if (!transaction) continue;
+    if (transaction.status === 'completed') return { state: 'completed', transaction };
+    if (['pending', 'processing'].includes(transaction.status)) return { state: 'pending', transaction };
+  }
+  return null;
 }
 
 async function getEarningsLeaderboard(currentUserId, limit = 10) {
@@ -2926,21 +2969,38 @@ app.post('/api/payments/wallet/subscription', requireAuth, writeLimiter, async (
     if (existing) {
       if (existing.provider !== 'wallet') return failure(res, 409, 'This checkout reference already belongs to a Paynow payment. Close the checkout and start a new wallet payment.');
       transaction = existing;
-      if (['completed', 'rejected', 'cancelled', 'reversed'].includes(existing.status)) {
+      if (existing.status === 'completed') {
         const subscription = await Subscription.findOne({ paymentTransactionId: existing._id }).lean();
         return success(res, await completedWalletPurchaseResponse(existing, { subscription }), 200);
+      }
+      if (['rejected', 'cancelled', 'reversed'].includes(existing.status)) {
+        return failure(res, 409, 'This wallet checkout attempt has already ended. Start a fresh wallet payment and try again.', [{
+          code: 'wallet_checkout_terminal',
+          reference: existing.reference,
+          status: existing.status,
+        }]);
       }
     }
 
     if (!transaction) {
-      const pendingPaynow = await Transaction.exists({
+      const paynowBlocker = await resolvePaynowBlockerBeforeWalletPurchase({
         userId: req.user._id,
         type: 'subscription',
-        provider: { $in: ['paynow', 'mock'] },
-        status: { $in: ['pending', 'processing'] },
-        'metadata.planCode': plan.planCode,
+        planCode: plan.planCode,
       });
-      if (pendingPaynow) return failure(res, 409, 'A Paynow payment for this plan is still pending. Complete or allow it to expire before paying from the wallet.');
+      if (paynowBlocker?.state === 'completed') {
+        return failure(res, 409, 'A Paynow payment for this plan completed while its status was being checked. Refresh your subscription before paying again.', [{
+          code: 'paynow_subscription_already_completed',
+          reference: paynowBlocker.transaction.reference,
+        }]);
+      }
+      if (paynowBlocker?.state === 'pending') {
+        return failure(res, 409, `Paynow checkout ${paynowBlocker.transaction.reference} is still pending. Its status was refreshed just now. Complete that checkout or wait for Paynow to confirm failure/cancellation before paying from the wallet.`, [{
+          code: 'paynow_subscription_still_pending',
+          reference: paynowBlocker.transaction.reference,
+          status: paynowBlocker.transaction.status,
+        }]);
+      }
 
       await ensureUserResources(req.user._id);
       const reference = createReference('SUBW');
@@ -3104,16 +3164,39 @@ app.post('/api/payments/wallet/league-entry', requireAuth, writeLimiter, async (
     if (existing) {
       if (existing.provider !== 'wallet') return failure(res, 409, 'This checkout reference already belongs to a Paynow payment. Close the checkout and start a new wallet payment.');
       transaction = existing;
-      if (['completed', 'rejected', 'cancelled', 'reversed'].includes(existing.status)) {
+      if (existing.status === 'completed') {
         return success(res, await completedWalletPurchaseResponse(existing, { league: await leagueView(league, req.user._id) }), 200);
+      }
+      if (['rejected', 'cancelled', 'reversed'].includes(existing.status)) {
+        return failure(res, 409, 'This wallet checkout attempt has already ended. Start a fresh wallet payment and try again.', [{
+          code: 'wallet_checkout_terminal',
+          reference: existing.reference,
+          status: existing.status,
+        }]);
       }
     }
 
     entry = await LeagueEntry.findOne({ leagueId: league._id, userId: req.user._id });
     if (entry?.paymentStatus === 'paid') return failure(res, 409, 'You have already paid and joined this league.');
     if (entry?.paymentTransactionId) {
-      const pending = await Transaction.findOne({ _id: entry.paymentTransactionId, provider: { $in: ['paynow', 'mock'] }, status: { $in: ['pending', 'processing'] } });
-      if (pending) return failure(res, 409, 'A Paynow payment for this league is still pending. Complete or allow it to expire before paying from the wallet.');
+      const paynowBlocker = await resolvePaynowBlockerBeforeWalletPurchase({
+        userId: req.user._id,
+        type: 'entry-fee',
+        leagueId: league._id,
+      });
+      if (paynowBlocker?.state === 'completed') {
+        return failure(res, 409, 'Your Paynow payment for this league completed while its status was being checked. Refresh the league before paying again.', [{
+          code: 'paynow_league_entry_already_completed',
+          reference: paynowBlocker.transaction.reference,
+        }]);
+      }
+      if (paynowBlocker?.state === 'pending') {
+        return failure(res, 409, `Paynow checkout ${paynowBlocker.transaction.reference} is still pending. Its status was refreshed just now. Complete that checkout or wait for Paynow to confirm failure/cancellation before paying from the wallet.`, [{
+          code: 'paynow_league_entry_still_pending',
+          reference: paynowBlocker.transaction.reference,
+          status: paynowBlocker.transaction.status,
+        }]);
+      }
     }
 
     if (!entry) {
@@ -4808,24 +4891,51 @@ const localGrowth = (() => {
       async function enrollSubscribersInSupremeLeagues() {
         const now = new Date();
         const metas = await SupremeLeagueMeta.find({ settlementStatus: 'open', joinDeadlineAt: { $gt: now } }).lean();
+        const subscriptions = await Subscription.find({
+          status: 'active',
+          $or: [
+            { endDate: { $gt: now } },
+            { validUntil: { $gt: now } },
+            { endDate: null, validUntil: null },
+          ],
+        }).lean();
+
         let enrolled = 0;
+        let alreadyEntered = 0;
+        let notEntitled = 0;
+        let missingUser = 0;
+        let suspended = 0;
+        let missingManagerId = 0;
+        let eligiblePairs = 0;
     
         for (const meta of metas) {
-          const subscriptions = await Subscription.find({
-            status: 'active',
-            $or: [
-              { endDate: { $gt: now } },
-              { validUntil: { $gt: now } },
-              { endDate: null, validUntil: null },
-            ],
-          }).lean();
-    
           for (const sub of subscriptions) {
-            if (!subscriptionEntitles(sub, meta.cadence)) continue;
+            if (!subscriptionEntitles(sub, meta.cadence)) {
+              notEntitled += 1;
+              continue;
+            }
+
             const user = await User.findById(sub.userId).lean();
-            if (!user || user.status === 'suspended' || !user.fplManagerId) continue;
+            if (!user) {
+              missingUser += 1;
+              continue;
+            }
+            if (user.status === 'suspended') {
+              suspended += 1;
+              continue;
+            }
+            if (!user.fplManagerId) {
+              missingManagerId += 1;
+              continue;
+            }
+
+            eligiblePairs += 1;
             const exists = await LeagueEntry.exists({ leagueId: meta.leagueId, userId: user._id });
-            if (exists) continue;
+            if (exists) {
+              alreadyEntered += 1;
+              continue;
+            }
+
             await LeagueEntry.create({
               leagueId: meta.leagueId,
               userId: user._id,
@@ -4843,7 +4953,18 @@ const localGrowth = (() => {
             enrolled += 1;
           }
         }
-        return { enrolled };
+
+        return {
+          enrolled,
+          openCompetitions: metas.length,
+          activeSubscriptions: subscriptions.length,
+          eligiblePairs,
+          alreadyEntered,
+          notEntitled,
+          missingUser,
+          suspended,
+          missingManagerId,
+        };
       }
     
       async function managerPoints(managerId, startGameweek, endGameweek) {
@@ -4963,13 +5084,74 @@ const localGrowth = (() => {
         return { settled: true, winners: winners.length };
       }
     
+      function supremeCompetitionIsFinished(meta, bootstrap) {
+        const events = bootstrap?.events || [];
+        const relevant = events.filter(
+          (event) => Number(event.id) >= Number(meta.startGameweek) && Number(event.id) <= Number(meta.endGameweek)
+        );
+        return relevant.length > 0 && relevant.every((event) => Boolean(event.finished));
+      }
+
+      async function recoverUnfinishedSupremeLeagueStates(bootstrapInput = null) {
+        const bootstrap = bootstrapInput || await fetchFplBootstrap();
+        const stuck = await SupremeLeagueMeta.find({ settlementStatus: 'scoring', settledAt: null });
+        let reopened = 0;
+        let keptScoring = 0;
+
+        for (const meta of stuck) {
+          // A scoring state is only legitimate after every FPL event in this competition has finished.
+          // Older builds claimed the record before checking this condition, leaving future competitions stuck.
+          if (supremeCompetitionIsFinished(meta, bootstrap)) {
+            keptScoring += 1;
+            continue;
+          }
+
+          meta.settlementStatus = 'open';
+          meta.lastError = '';
+          meta.lastMaintenanceAt = new Date();
+          await meta.save();
+
+          await League.updateOne(
+            { _id: meta.leagueId, status: { $ne: 'settled' } },
+            { $set: { status: new Date() < new Date(meta.joinDeadlineAt) ? 'open' : 'live' } }
+          );
+          reopened += 1;
+        }
+
+        return { checked: stuck.length, reopened, keptScoring };
+      }
+
       async function settleFinishedSupremeLeagues() {
         const bootstrap = await fetchFplBootstrap();
-        const metas = await SupremeLeagueMeta.find({ settlementStatus: { $in: ['open', 'failed'] } }).select('_id');
+
+        // Repair records left in `scoring` by the old claim-before-finished-check bug.
+        await recoverUnfinishedSupremeLeagueStates(bootstrap);
+
+        const metas = await SupremeLeagueMeta.find({ settlementStatus: { $in: ['open', 'failed'] } });
         let settled = 0;
+        let notFinished = 0;
+
         for (const candidate of metas) {
-          const meta = await SupremeLeagueMeta.findOneAndUpdate({ _id: candidate._id, settlementStatus: { $in: ['open', 'failed'] } }, { $set: { settlementStatus: 'scoring', settlementLockId: createReference('SET'), settlementLockedAt: new Date(), lastMaintenanceAt: new Date() } }, { new: true });
+          // IMPORTANT: Never change an unfinished competition to `scoring`.
+          // Enrollment depends on unfinished competitions remaining `open`.
+          if (!supremeCompetitionIsFinished(candidate, bootstrap)) {
+            if (candidate.settlementStatus === 'failed') {
+              candidate.settlementStatus = 'open';
+              candidate.lastError = '';
+              candidate.lastMaintenanceAt = new Date();
+              await candidate.save();
+            }
+            notFinished += 1;
+            continue;
+          }
+
+          const meta = await SupremeLeagueMeta.findOneAndUpdate(
+            { _id: candidate._id, settlementStatus: { $in: ['open', 'failed'] } },
+            { $set: { settlementStatus: 'scoring', lastMaintenanceAt: new Date() } },
+            { new: true }
+          );
           if (!meta) continue;
+
           try {
             const result = await settleSupremeLeague(meta, bootstrap);
             if (result.settled) settled += 1;
@@ -4981,7 +5163,7 @@ const localGrowth = (() => {
             console.error(`Supreme settlement failed for ${meta.cycleKey}:`, meta.lastError);
           }
         }
-        return { settled };
+        return { settled, notFinished };
       }
     
       async function runMaintenance() {
@@ -5105,6 +5287,7 @@ const localGrowth = (() => {
         notifySupportTicketReceived,
         ensureSupremeLeagues,
         enrollSubscribersInSupremeLeagues,
+        recoverUnfinishedSupremeLeagueStates,
         settleFinishedSupremeLeagues,
         runMaintenance,
         startTimers,
@@ -5327,7 +5510,7 @@ async function prepareRuntime() {
 
       // Serverless requests must never trigger scheduled maintenance implicitly.
       // Vercel executes the protected daily cron endpoint once per UTC day.
-      if (!IS_VERCEL) {
+      if (!IS_VERCEL && !LOCAL_LEAGUE_ENROLLMENT_TEST_CRON) {
         await ensureDemoUser();
         if (SEED_DEMO_DATA) await ensureDemoLeagues();
         await backfillLeagueEntryFantasyManagerIds();
@@ -5336,6 +5519,9 @@ async function prepareRuntime() {
         await expireSubscriptions();
         await reconcileProcessingWalletPurchases();
       }
+      if (!IS_VERCEL && LOCAL_LEAGUE_ENROLLMENT_TEST_CRON) {
+        console.warn('[LOCAL ENROLLMENT TEST] Normal startup maintenance and demo seeding are disabled for this diagnostic run.');
+      }
       return true;
     })().catch((error) => {
       global.__sflRuntimePromise = null;
@@ -5343,6 +5529,41 @@ async function prepareRuntime() {
     });
   }
   return global.__sflRuntimePromise;
+}
+
+async function runLocalLeagueEnrollmentTestCycle() {
+  const startedAt = new Date();
+  if (IS_VERCEL) {
+    console.warn('[LOCAL ENROLLMENT TEST] Skipped because this runtime is Vercel.');
+    return { skipped: true, reason: 'vercel-runtime' };
+  }
+  if (!LOCAL_LEAGUE_ENROLLMENT_TEST_CRON) {
+    return { skipped: true, reason: 'disabled' };
+  }
+  if (FPL_DATA_MODE !== 'public') {
+    throw new Error('LOCAL_LEAGUE_ENROLLMENT_TEST_CRON requires FPL_DATA_MODE=public.');
+  }
+
+  console.log(`[LOCAL ENROLLMENT TEST] Starting ${startedAt.toISOString()}`);
+  const supremeCreated = await localGrowth.ensureSupremeLeagues();
+
+  // Repair unfinished competitions that an older settlement run left stuck in `scoring`.
+  // This happens before enrollment because enrollment intentionally considers only `open` competitions.
+  const supremeStateRepair = await localGrowth.recoverUnfinishedSupremeLeagueStates();
+
+  // Reconcile every currently active subscription against every currently open matching Supreme league.
+  // Existing entries are checked before insert, so this can be repeated safely without duplicates.
+  const supremeEnrollment = await localGrowth.enrollSubscribersInSupremeLeagues();
+  const completedAt = new Date();
+  const result = {
+    startedAt: startedAt.toISOString(),
+    completedAt: completedAt.toISOString(),
+    supremeCreated,
+    supremeStateRepair,
+    supremeEnrollment,
+  };
+  console.log('[LOCAL ENROLLMENT TEST] Completed:', JSON.stringify(result));
+  return result;
 }
 
 async function start() {
@@ -5357,40 +5578,57 @@ async function start() {
 
   // In-process timers are used on long-running Node hosts; external cron remains the durable production trigger.
   if (!IS_VERCEL) {
-    const subscriptionTimer = setInterval(
-      () => expireSubscriptions().catch((error) => console.error('Subscription validity check failed', error.message)),
-      SUBSCRIPTION_CHECK_INTERVAL_MS
-    );
-    const paynowTimer = setInterval(
-      async () => {
-        try {
-          await reconcilePendingPaynowPayments();
-          await reconcileProcessingWalletPurchases();
-        } catch (error) {
-          console.error('Payment reconciliation check failed', error.message);
-        }
-      },
-      PAYNOW_PENDING_RECONCILE_INTERVAL_MS
-    );
-    const leagueScoreTimer = setInterval(
-      () => syncActiveLeagueScores().catch((error) => console.error('League score sync failed', error.message)),
-      FPL_LEAGUE_SYNC_INTERVAL_MS
-    );
-    const leagueLifecycleTimer = setInterval(
-      () => updateExpiredLeagueStatuses().catch((error) => console.error('League lifecycle update failed', error.message)),
-      Math.min(FPL_LEAGUE_SYNC_INTERVAL_MS, 15 * 60 * 1000)
-    );
-    const teamReminderTimer = setInterval(
-      () => emailService.sendStaleTeamReminders().catch((error) => console.error('Team reminder check failed', error.message)),
-      emailService.reminderCheckIntervalMs
-    );
-    emailService.sendStaleTeamReminders().catch((error) => console.error('Initial team reminder check failed', error.message));
-    localGrowth.startTimers();
-    subscriptionTimer.unref?.();
-    paynowTimer.unref?.();
-    leagueScoreTimer.unref?.();
-    leagueLifecycleTimer.unref?.();
-    teamReminderTimer.unref?.();
+    if (LOCAL_LEAGUE_ENROLLMENT_TEST_CRON) {
+      console.warn('[LOCAL ENROLLMENT TEST] ENABLED: this process will write eligible Supreme league entries to the configured MongoDB database.');
+      console.warn('[LOCAL ENROLLMENT TEST] Scope: ensure Supreme leagues + repair unfinished stuck scoring states + reconcile active subscriber entries. Interval: 3 minutes.');
+      console.warn('[LOCAL ENROLLMENT TEST] Normal payment, expiry, scoring, reminder and growth timers are disabled for this diagnostic run.');
+
+      // Run one diagnostic pass shortly after startup, then repeat every 3 minutes.
+      setTimeout(
+        () => runLocalLeagueEnrollmentTestCycle().catch((error) => console.error('[LOCAL ENROLLMENT TEST] Initial cycle failed:', error.message)),
+        3000
+      );
+      const localLeagueEnrollmentTestTimer = setInterval(
+        () => runLocalLeagueEnrollmentTestCycle().catch((error) => console.error('[LOCAL ENROLLMENT TEST] Cycle failed:', error.message)),
+        LOCAL_LEAGUE_ENROLLMENT_TEST_INTERVAL_MS
+      );
+      localLeagueEnrollmentTestTimer.unref?.();
+    } else {
+      const subscriptionTimer = setInterval(
+        () => expireSubscriptions().catch((error) => console.error('Subscription validity check failed', error.message)),
+        SUBSCRIPTION_CHECK_INTERVAL_MS
+      );
+      const paynowTimer = setInterval(
+        async () => {
+          try {
+            await reconcilePendingPaynowPayments();
+            await reconcileProcessingWalletPurchases();
+          } catch (error) {
+            console.error('Payment reconciliation check failed', error.message);
+          }
+        },
+        PAYNOW_PENDING_RECONCILE_INTERVAL_MS
+      );
+      const leagueScoreTimer = setInterval(
+        () => syncActiveLeagueScores().catch((error) => console.error('League score sync failed', error.message)),
+        FPL_LEAGUE_SYNC_INTERVAL_MS
+      );
+      const leagueLifecycleTimer = setInterval(
+        () => updateExpiredLeagueStatuses().catch((error) => console.error('League lifecycle update failed', error.message)),
+        Math.min(FPL_LEAGUE_SYNC_INTERVAL_MS, 15 * 60 * 1000)
+      );
+      const teamReminderTimer = setInterval(
+        () => emailService.sendStaleTeamReminders().catch((error) => console.error('Team reminder check failed', error.message)),
+        emailService.reminderCheckIntervalMs
+      );
+      emailService.sendStaleTeamReminders().catch((error) => console.error('Initial team reminder check failed', error.message));
+      localGrowth.startTimers();
+      subscriptionTimer.unref?.();
+      paynowTimer.unref?.();
+      leagueScoreTimer.unref?.();
+      leagueLifecycleTimer.unref?.();
+      teamReminderTimer.unref?.();
+    }
   }
   return server;
 }
@@ -5403,6 +5641,7 @@ if (require.main === module) {
 }
 
 module.exports = app;
+module.exports.runLocalLeagueEnrollmentTestCycle = runLocalLeagueEnrollmentTestCycle;
 module.exports.prepareRuntime = prepareRuntime;
 module.exports.connectDatabase = connectDatabase;
 module.exports.runDailyMaintenanceTasks = runDailyMaintenanceTasks;

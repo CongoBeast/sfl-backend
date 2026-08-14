@@ -1163,7 +1163,7 @@ function setSessionCookie(res, token) {
   res.cookie(COOKIE_NAME, token, {
     httpOnly: true,
     secure: IS_PRODUCTION,
-    sameSite: 'lax',
+    sameSite: IS_PRODUCTION ? 'none' : 'lax',
     maxAge: 7 * 24 * 60 * 60 * 1000,
     path: '/',
   });
@@ -1766,12 +1766,13 @@ async function processPaynowStatus(transaction, paynowData) {
 
 async function reconcilePendingPaynowPayments() {
   if (!PAYNOW_PAYMENTS) return;
+  // Reconcile every unresolved Paynow checkout, including transactions older than 48 hours.
+  // The previous age filter could leave an abandoned checkout permanently blocking wallet payment.
   const transactions = await Transaction.find({
     provider: 'paynow',
     status: { $in: ['pending', 'processing'] },
     'metadata.pollUrl': { $exists: true, $ne: '' },
-    createdAt: { $gte: new Date(Date.now() - 48 * 60 * 60 * 1000) },
-  }).sort({ updatedAt: 1 }).limit(25);
+  }).sort({ updatedAt: 1 }).limit(50);
   for (const transaction of transactions) {
     try {
       const status = await pollPaynowTransaction(transaction);
@@ -1780,6 +1781,43 @@ async function reconcilePendingPaynowPayments() {
       console.error('Paynow reconciliation failed', transaction.reference, error.message);
     }
   }
+}
+
+async function resolvePaynowBlockerBeforeWalletPurchase({ userId, type, planCode = '', leagueId = null }) {
+  const query = {
+    userId,
+    type,
+    provider: { $in: ['paynow', 'mock'] },
+    status: { $in: ['pending', 'processing'] },
+  };
+  if (planCode) query['metadata.planCode'] = planCode;
+  if (leagueId) query.leagueId = leagueId;
+
+  const candidates = await Transaction.find(query).sort({ createdAt: 1 }).limit(10);
+  for (let transaction of candidates) {
+    // Before blocking a wallet purchase, refresh the provider state synchronously.
+    // This clears checkouts that Paynow has already marked failed/cancelled and avoids
+    // making the user wait for the maintenance job.
+    if (
+      transaction.provider === 'paynow'
+      && PAYNOW_PAYMENTS
+      && transaction.metadata?.pollUrl
+      && ['pending', 'processing'].includes(transaction.status)
+    ) {
+      try {
+        const status = await pollPaynowTransaction(transaction);
+        if (status) transaction = await processPaynowStatus(transaction, status);
+      } catch (error) {
+        console.error('Paynow blocker refresh failed', transaction.reference, error.message);
+        transaction = await Transaction.findById(transaction._id);
+      }
+    }
+
+    if (!transaction) continue;
+    if (transaction.status === 'completed') return { state: 'completed', transaction };
+    if (['pending', 'processing'].includes(transaction.status)) return { state: 'pending', transaction };
+  }
+  return null;
 }
 
 async function getEarningsLeaderboard(currentUserId, limit = 10) {
@@ -2906,21 +2944,38 @@ app.post('/api/payments/wallet/subscription', requireAuth, writeLimiter, async (
     if (existing) {
       if (existing.provider !== 'wallet') return failure(res, 409, 'This checkout reference already belongs to a Paynow payment. Close the checkout and start a new wallet payment.');
       transaction = existing;
-      if (['completed', 'rejected', 'cancelled', 'reversed'].includes(existing.status)) {
+      if (existing.status === 'completed') {
         const subscription = await Subscription.findOne({ paymentTransactionId: existing._id }).lean();
         return success(res, await completedWalletPurchaseResponse(existing, { subscription }), 200);
+      }
+      if (['rejected', 'cancelled', 'reversed'].includes(existing.status)) {
+        return failure(res, 409, 'This wallet checkout attempt has already ended. Start a fresh wallet payment and try again.', [{
+          code: 'wallet_checkout_terminal',
+          reference: existing.reference,
+          status: existing.status,
+        }]);
       }
     }
 
     if (!transaction) {
-      const pendingPaynow = await Transaction.exists({
+      const paynowBlocker = await resolvePaynowBlockerBeforeWalletPurchase({
         userId: req.user._id,
         type: 'subscription',
-        provider: { $in: ['paynow', 'mock'] },
-        status: { $in: ['pending', 'processing'] },
-        'metadata.planCode': plan.planCode,
+        planCode: plan.planCode,
       });
-      if (pendingPaynow) return failure(res, 409, 'A Paynow payment for this plan is still pending. Complete or allow it to expire before paying from the wallet.');
+      if (paynowBlocker?.state === 'completed') {
+        return failure(res, 409, 'A Paynow payment for this plan completed while its status was being checked. Refresh your subscription before paying again.', [{
+          code: 'paynow_subscription_already_completed',
+          reference: paynowBlocker.transaction.reference,
+        }]);
+      }
+      if (paynowBlocker?.state === 'pending') {
+        return failure(res, 409, `Paynow checkout ${paynowBlocker.transaction.reference} is still pending. Its status was refreshed just now. Complete that checkout or wait for Paynow to confirm failure/cancellation before paying from the wallet.`, [{
+          code: 'paynow_subscription_still_pending',
+          reference: paynowBlocker.transaction.reference,
+          status: paynowBlocker.transaction.status,
+        }]);
+      }
 
       await ensureUserResources(req.user._id);
       const reference = createReference('SUBW');
@@ -3084,16 +3139,39 @@ app.post('/api/payments/wallet/league-entry', requireAuth, writeLimiter, async (
     if (existing) {
       if (existing.provider !== 'wallet') return failure(res, 409, 'This checkout reference already belongs to a Paynow payment. Close the checkout and start a new wallet payment.');
       transaction = existing;
-      if (['completed', 'rejected', 'cancelled', 'reversed'].includes(existing.status)) {
+      if (existing.status === 'completed') {
         return success(res, await completedWalletPurchaseResponse(existing, { league: await leagueView(league, req.user._id) }), 200);
+      }
+      if (['rejected', 'cancelled', 'reversed'].includes(existing.status)) {
+        return failure(res, 409, 'This wallet checkout attempt has already ended. Start a fresh wallet payment and try again.', [{
+          code: 'wallet_checkout_terminal',
+          reference: existing.reference,
+          status: existing.status,
+        }]);
       }
     }
 
     entry = await LeagueEntry.findOne({ leagueId: league._id, userId: req.user._id });
     if (entry?.paymentStatus === 'paid') return failure(res, 409, 'You have already paid and joined this league.');
     if (entry?.paymentTransactionId) {
-      const pending = await Transaction.findOne({ _id: entry.paymentTransactionId, provider: { $in: ['paynow', 'mock'] }, status: { $in: ['pending', 'processing'] } });
-      if (pending) return failure(res, 409, 'A Paynow payment for this league is still pending. Complete or allow it to expire before paying from the wallet.');
+      const paynowBlocker = await resolvePaynowBlockerBeforeWalletPurchase({
+        userId: req.user._id,
+        type: 'entry-fee',
+        leagueId: league._id,
+      });
+      if (paynowBlocker?.state === 'completed') {
+        return failure(res, 409, 'Your Paynow payment for this league completed while its status was being checked. Refresh the league before paying again.', [{
+          code: 'paynow_league_entry_already_completed',
+          reference: paynowBlocker.transaction.reference,
+        }]);
+      }
+      if (paynowBlocker?.state === 'pending') {
+        return failure(res, 409, `Paynow checkout ${paynowBlocker.transaction.reference} is still pending. Its status was refreshed just now. Complete that checkout or wait for Paynow to confirm failure/cancellation before paying from the wallet.`, [{
+          code: 'paynow_league_entry_still_pending',
+          reference: paynowBlocker.transaction.reference,
+          status: paynowBlocker.transaction.status,
+        }]);
+      }
     }
 
     if (!entry) {
