@@ -561,6 +561,11 @@ const subscriptionSchema = new Schema({
   renewalDate: { type: Date, default: null },
   endDate: { type: Date, default: null },
   validUntil: { type: Date, default: null, index: true },
+  // Monthly Entry subscriptions are tied to one FPL calendar-month competition cycle.
+  // These fields prevent a subscription that remains valid through the final GW from
+  // accidentally qualifying for the next month's Supreme Monthly League.
+  monthlyCycleKey: { type: String, default: '' },
+  validThroughGameweek: { type: Number, default: null },
   lastValidityCheckAt: { type: Date, default: null },
   autoRenew: { type: Boolean, default: false },
   paymentTransactionId: { type: Schema.Types.ObjectId, ref: 'Transaction', default: null },
@@ -1243,14 +1248,193 @@ async function walletOperationApplied(userId, operationReference) {
   return Boolean(await Wallet.exists({ userId, appliedTransactionReferences: operationReference }));
 }
 
-function subscriptionDates(plan, startDate = new Date()) {
-  const validUntil = new Date(startDate.getTime() + Number(plan.validityDays || 30) * 86400000);
+function utcMonthKey(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function monthlySubscriptionWindowFromBootstrap(startDate, bootstrap) {
+  const anchor = new Date(startDate);
+  if (Number.isNaN(anchor.getTime())) throw new Error('Monthly subscription start date is invalid.');
+
+  const events = (Array.isArray(bootstrap?.events) ? bootstrap.events : [])
+    .filter((event) => event?.deadline_time && Number.isFinite(new Date(event.deadline_time).getTime()))
+    .sort((a, b) => new Date(a.deadline_time) - new Date(b.deadline_time));
+
+  if (!events.length) throw new Error('FPL did not return a usable gameweek schedule.');
+
+  let targetYear = anchor.getUTCFullYear();
+  let targetMonth = anchor.getUTCMonth();
+  let cycleEvents = events.filter((event) => {
+    const deadline = new Date(event.deadline_time);
+    return deadline.getUTCFullYear() === targetYear && deadline.getUTCMonth() === targetMonth;
+  });
+
+  // During an off-season month with no FPL deadline, sell access to the next
+  // scheduled FPL month rather than creating an arbitrary 30-day entitlement.
+  if (!cycleEvents.length) {
+    const nextEvent = events.find((event) => new Date(event.deadline_time) >= anchor);
+    if (!nextEvent) throw new Error('No future FPL gameweek is available for a monthly subscription.');
+    const nextDeadline = new Date(nextEvent.deadline_time);
+    targetYear = nextDeadline.getUTCFullYear();
+    targetMonth = nextDeadline.getUTCMonth();
+    cycleEvents = events.filter((event) => {
+      const deadline = new Date(event.deadline_time);
+      return deadline.getUTCFullYear() === targetYear && deadline.getUTCMonth() === targetMonth;
+    });
+  }
+
+  if (!cycleEvents.length) throw new Error('No FPL gameweeks were found for the monthly subscription cycle.');
+
+  const firstEvent = cycleEvents[0];
+  const lastEvent = cycleEvents[cycleEvents.length - 1];
+  const lastDeadline = new Date(lastEvent.deadline_time);
+  const nextEvent = events.find((event) => new Date(event.deadline_time) > lastDeadline);
+
+  // FPL bootstrap exposes deadlines and a finished flag, not a canonical final-whistle
+  // timestamp. The next FPL deadline is therefore the safe time boundary; the daily
+  // reconciler expires the subscription earlier as soon as the final GW is marked finished.
+  const validUntil = nextEvent?.deadline_time
+    ? new Date(nextEvent.deadline_time)
+    : new Date(lastDeadline.getTime() + 8 * 86400000);
+
   return {
+    monthlyCycleKey: `${targetYear}-${String(targetMonth + 1).padStart(2, '0')}`,
+    startGameweek: Number(firstEvent.id),
+    validThroughGameweek: Number(lastEvent.id),
+    validUntil,
+    cycleFinished: Boolean(lastEvent.finished || lastEvent.data_checked),
+  };
+}
+
+async function subscriptionDates(plan, startDate = new Date()) {
+  const fallbackValidUntil = new Date(startDate.getTime() + Number(plan.validityDays || 30) * 86400000);
+  const fallback = {
     startDate,
     activatedAt: startDate,
-    validUntil,
-    endDate: validUntil,
-    renewalDate: plan.billingInterval === 'monthly' ? validUntil : null,
+    validUntil: fallbackValidUntil,
+    endDate: fallbackValidUntil,
+    renewalDate: plan.billingInterval === 'monthly' ? fallbackValidUntil : null,
+    monthlyCycleKey: '',
+    validThroughGameweek: null,
+  };
+
+  if (plan?.planCode !== PLAN_CODES.MONTHLY || FPL_DATA_MODE !== 'public') return fallback;
+
+  try {
+    const bootstrap = await fetchFplJson('/bootstrap-static/', { cacheMinutes: 5 });
+    const window = monthlySubscriptionWindowFromBootstrap(startDate, bootstrap);
+    return {
+      ...fallback,
+      validUntil: window.validUntil,
+      endDate: window.validUntil,
+      renewalDate: window.validUntil,
+      monthlyCycleKey: window.monthlyCycleKey,
+      validThroughGameweek: window.validThroughGameweek,
+    };
+  } catch (error) {
+    // Do not fail a paid checkout just because FPL is temporarily unavailable.
+    // Daily maintenance will reconcile the date once the provider recovers.
+    console.warn('Monthly subscription schedule fallback used:', error.message);
+    return fallback;
+  }
+}
+
+async function reconcileMonthlySubscriptionWindows({ userId = null } = {}) {
+  if (FPL_DATA_MODE !== 'public') {
+    return { skipped: true, reason: 'fpl-data-mode-not-public', checked: 0, corrected: 0, reactivated: 0, expired: 0 };
+  }
+
+  const now = new Date();
+  const bootstrap = await fetchFplJson('/bootstrap-static/', { cacheMinutes: 5 });
+  const query = {
+    planCode: PLAN_CODES.MONTHLY,
+    status: { $in: ['active', 'expired'] },
+    ...(userId ? { userId } : {}),
+  };
+  const subscriptions = await Subscription.find(query).sort({ activatedAt: 1, createdAt: 1 });
+
+  let corrected = 0;
+  let reactivated = 0;
+  let expired = 0;
+  let unchanged = 0;
+  let failed = 0;
+
+  for (const subscription of subscriptions) {
+    try {
+      const anchor = subscription.activatedAt || subscription.startDate || subscription.createdAt;
+      const window = monthlySubscriptionWindowFromBootstrap(anchor, bootstrap);
+      const timeBoundaryPassed = window.validUntil <= now;
+      const shouldBeExpired = window.cycleFinished || timeBoundaryPassed;
+
+      const targetStatus = shouldBeExpired ? 'expired' : 'active';
+      let targetValidUntil = window.validUntil;
+
+      // If FPL explicitly marks the final monthly GW finished before the fallback
+      // boundary, expire now. Preserve an already-recorded earlier expiry on reruns.
+      if (window.cycleFinished && subscription.status === 'active') {
+        targetValidUntil = now;
+      } else if (
+        window.cycleFinished
+        && subscription.status === 'expired'
+        && subscription.validUntil
+        && new Date(subscription.validUntil) <= now
+      ) {
+        targetValidUntil = new Date(subscription.validUntil);
+      }
+
+      const currentValidUntil = subscription.validUntil ? new Date(subscription.validUntil).getTime() : null;
+      const currentEndDate = subscription.endDate ? new Date(subscription.endDate).getTime() : null;
+      const currentRenewalDate = subscription.renewalDate ? new Date(subscription.renewalDate).getTime() : null;
+      const targetMs = targetValidUntil.getTime();
+
+      const changed = (
+        subscription.status !== targetStatus
+        || String(subscription.monthlyCycleKey || '') !== window.monthlyCycleKey
+        || Number(subscription.validThroughGameweek || 0) !== Number(window.validThroughGameweek || 0)
+        || currentValidUntil !== targetMs
+        || currentEndDate !== targetMs
+        || currentRenewalDate !== targetMs
+      );
+
+      if (!changed) {
+        unchanged += 1;
+        continue;
+      }
+
+      if (subscription.status === 'expired' && targetStatus === 'active') reactivated += 1;
+      if (subscription.status === 'active' && targetStatus === 'expired') expired += 1;
+
+      await Subscription.updateOne(
+        { _id: subscription._id },
+        {
+          $set: {
+            status: targetStatus,
+            monthlyCycleKey: window.monthlyCycleKey,
+            validThroughGameweek: window.validThroughGameweek,
+            validUntil: targetValidUntil,
+            endDate: targetValidUntil,
+            renewalDate: targetValidUntil,
+            lastValidityCheckAt: now,
+          },
+        }
+      );
+      corrected += 1;
+    } catch (error) {
+      failed += 1;
+      console.error('Monthly subscription reconciliation failed', subscription._id, error.message);
+    }
+  }
+
+  return {
+    skipped: false,
+    checked: subscriptions.length,
+    corrected,
+    reactivated,
+    expired,
+    unchanged,
+    failed,
   };
 }
 
@@ -1558,7 +1742,7 @@ async function finalizeSuccessfulPayment(transaction, paynowData) {
       if (!subscription) throw new Error('The pending subscription record could not be found.');
       const plan = resolveSubscriptionPlan(subscription.planCode);
       if (!plan) throw new Error('The subscription plan is no longer available.');
-      const dates = subscriptionDates(plan);
+      const dates = await subscriptionDates(plan);
       await Subscription.updateMany(
         { userId: locked.userId, status: 'active', _id: { $ne: subscription._id } },
         { $set: { status: 'replaced', endDate: new Date(), validUntil: new Date(), lastValidityCheckAt: new Date() } }
@@ -2550,18 +2734,31 @@ async function buildTeamPayload(user) {
 
   let providerData = null;
   let providerWarning = '';
+  let syncAvailable = true;
   try {
     providerData = await loadFantasyTeam(user.fplManagerId);
   } catch (error) {
-    if (!latest) throw error;
-    providerWarning = `${error.message} Showing the last successful sync instead.`;
+    syncAvailable = false;
+    providerWarning = latest
+      ? `${error.message} Showing the last successful sync instead.`
+      : `${error.message} Your FPL account is linked; full team sync will become available when FPL publishes gameweek team data.`;
   }
 
   const latestMatchesMode = latest && latest.providerMode === FPL_DATA_MODE;
-  const snapshot = latestMatchesMode ? latest : providerData?.snapshot || latest;
-  const manager = providerData?.manager || {
+  const snapshot = latestMatchesMode ? latest : providerData?.snapshot || latest || null;
+
+  let basicManager = null;
+  if (!providerData?.manager) {
+    try {
+      basicManager = await fantasyProvider.getManager(user.fplManagerId);
+    } catch (error) {
+      basicManager = null;
+    }
+  }
+
+  const manager = providerData?.manager || basicManager || {
     managerId: user.fplManagerId,
-    teamName: snapshot?.teamName || user.fantasyTeamName,
+    teamName: snapshot?.teamName || user.fantasyTeamName || '',
     managerName: snapshot?.managerName || '',
   };
 
@@ -2570,6 +2767,7 @@ async function buildTeamPayload(user) {
     manager,
     history: providerData?.history || [],
     snapshot,
+    syncAvailable,
     providerMode: FPL_DATA_MODE,
     providerWarning,
     lastConfirmation: lastEntry?.lastConfirmedGameweek || 0,
@@ -3043,7 +3241,7 @@ app.post('/api/payments/wallet/subscription', requireAuth, writeLimiter, async (
       }
     }
 
-    const dates = subscriptionDates(plan);
+    const dates = await subscriptionDates(plan);
     await Subscription.updateMany(
       { userId: req.user._id, status: 'active', _id: { $ne: subscription._id } },
       { $set: { status: 'replaced', endDate: new Date(), validUntil: new Date(), lastValidityCheckAt: new Date() } }
@@ -3374,7 +3572,7 @@ async function reconcileProcessingWalletPurchases() {
             if (!subscription) throw createError;
           }
         }
-        const dates = subscriptionDates(plan);
+        const dates = await subscriptionDates(plan);
         await Subscription.updateMany(
           { userId: transaction.userId, status: 'active', _id: { $ne: subscription._id } },
           { $set: { status: 'replaced', endDate: new Date(), validUntil: new Date(), lastValidityCheckAt: new Date() } }
@@ -4856,9 +5054,27 @@ const localGrowth = (() => {
         'season-pass': new Set(['weekly', 'bi-weekly', 'monthly', 'half-season', 'season']),
       };
     
-      function subscriptionEntitles(subscription, cadence) {
+      function subscriptionEntitles(subscription, cadence, meta = null) {
         if (!subscription) return false;
         const code = String(subscription.planCode || '').trim();
+
+        // Monthly Entry belongs to exactly one FPL calendar-month cycle. validUntil
+        // can cross month-end so the final GW can finish, but that must never grant
+        // access to the next month's Supreme Monthly League.
+        if (code === 'monthly' && cadence === 'monthly') {
+          const metaCycleMatch = String(meta?.cycleKey || '').match(/:monthly:(\d{4}-\d{2})$/);
+          const metaCycleKey = metaCycleMatch?.[1] || '';
+          const storedCycleKey = String(subscription.monthlyCycleKey || '').trim();
+          if (metaCycleKey && storedCycleKey && metaCycleKey !== storedCycleKey) return false;
+
+          // Conservative legacy fallback until reconciliation fills monthlyCycleKey.
+          if (metaCycleKey && !storedCycleKey) {
+            const anchor = subscription.activatedAt || subscription.startDate || subscription.createdAt;
+            const inferred = anchor ? utcMonthKey(anchor) : '';
+            if (inferred && inferred !== metaCycleKey) return false;
+          }
+        }
+
         if (Array.isArray(subscription.competitionsIncluded) && subscription.competitionsIncluded.includes(cadence)) return true;
         return entitlementMap[code]?.has(cadence) || false;
       }
@@ -4879,7 +5095,7 @@ const localGrowth = (() => {
           }).lean();
     
           for (const sub of subscriptions) {
-            if (!subscriptionEntitles(sub, meta.cadence)) continue;
+            if (!subscriptionEntitles(sub, meta.cadence, meta)) continue;
             const user = await User.findById(sub.userId).lean();
             if (!user || user.status === 'suspended' || !user.fplManagerId) continue;
             const exists = await LeagueEntry.exists({ leagueId: meta.leagueId, userId: user._id });
@@ -5196,6 +5412,31 @@ const localGrowth = (() => {
   });
 })();
 
+// One-time/idempotent repair endpoint for existing Monthly Entry subscribers.
+// It recalculates their FPL month window, then immediately reconciles Supreme entries.
+app.post('/api/admin/maintenance/reconcile-monthly-subscriptions', requireAdmin, writeLimiter, async (req, res, next) => {
+  try {
+    const monthlySubscriptions = await reconcileMonthlySubscriptionWindows();
+    let supremeCreated = null;
+    let supremeStateRepair = null;
+    let supremeEnrollment = null;
+
+    if (FPL_DATA_MODE === 'public') {
+      supremeCreated = await localGrowth.ensureSupremeLeagues();
+      supremeStateRepair = await localGrowth.recoverUnfinishedSupremeLeagueStates();
+      supremeEnrollment = await localGrowth.enrollSubscribersInSupremeLeagues();
+    }
+
+    return success(res, {
+      monthlySubscriptions,
+      supremeCreated,
+      supremeStateRepair,
+      supremeEnrollment,
+      message: 'Monthly subscription windows and eligible Supreme league entries were reconciled.',
+    });
+  } catch (error) { next(error); }
+});
+
 // -----------------------------------------------------------------------------
 // Production static hosting and errors
 // -----------------------------------------------------------------------------
@@ -5213,6 +5454,7 @@ app.get('/api/internal/cron/maintenance', async (req, res, next) => {
     if (!process.env.CRON_SECRET || req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
       return failure(res, 401, 'Unauthorized cron request.');
     }
+    const monthlySubscriptions = await reconcileMonthlySubscriptionWindows();
     await expireSubscriptions();
     await reconcilePendingPaynowPayments();
     const walletPurchases = await reconcileProcessingWalletPurchases();
@@ -5223,7 +5465,8 @@ app.get('/api/internal/cron/maintenance', async (req, res, next) => {
     const growth = await localGrowth.runMaintenance();
     return success(res, {
       ranAt: new Date().toISOString(),
-      tasks: ['expire-subscriptions', 'reconcile-paynow', 'reconcile-wallet-purchases', 'backfill-league-manager-ids', 'sync-league-scores'],
+      tasks: ['reconcile-monthly-subscription-windows', 'expire-subscriptions', 'reconcile-paynow', 'reconcile-wallet-purchases', 'backfill-league-manager-ids', 'sync-league-scores'],
+      monthlySubscriptions,
       walletPurchases,
       backfilledManagerIds,
       backfilledLeagueExpiries,
@@ -5338,7 +5581,14 @@ async function start() {
   // In-process timers are used on long-running Node hosts; external cron remains the durable production trigger.
   if (!IS_VERCEL) {
     const subscriptionTimer = setInterval(
-      () => expireSubscriptions().catch((error) => console.error('Subscription validity check failed', error.message)),
+      async () => {
+        try {
+          await reconcileMonthlySubscriptionWindows();
+          await expireSubscriptions();
+        } catch (error) {
+          console.error('Subscription validity check failed', error.message);
+        }
+      },
       SUBSCRIPTION_CHECK_INTERVAL_MS
     );
     const paynowTimer = setInterval(
