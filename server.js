@@ -518,6 +518,7 @@ const walletSchema = new Schema({
   lifetimeSubscriptionFeesCents: { type: Number, default: 0 },
   lifetimePrizesCents: { type: Number, default: 0 },
   lifetimeRefundsCents: { type: Number, default: 0 },
+  lifetimeAdjustmentsCents: { type: Number, default: 0 },
   seededAt: { type: Date, default: null },
   seedAmountCents: { type: Number, default: 0 },
   lastBalanceUpdateAt: { type: Date, default: Date.now },
@@ -567,6 +568,11 @@ const subscriptionSchema = new Schema({
   monthlyCycleKey: { type: String, default: '' },
   validThroughGameweek: { type: Number, default: null },
   lastValidityCheckAt: { type: Date, default: null },
+  // Populated when an admin cancels a subscription made too late for its cycle
+  // (e.g. joined after a league's cutoff) and refunds it to the member's wallet.
+  cancelledAt: { type: Date, default: null },
+  cancelledBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+  cancellationReason: { type: String, default: '' },
   autoRenew: { type: Boolean, default: false },
   paymentTransactionId: { type: Schema.Types.ObjectId, ref: 'Transaction', default: null },
   paymentReference: { type: String, default: '' },
@@ -4581,6 +4587,127 @@ app.get('/api/admin/users', requireAdmin, async(req,res,next)=>{try{
 
 app.get('/api/admin/users/:id', requireAdmin, async(req,res,next)=>{try{const [user,profile,wallet,subscriptions,entries,transactions]=await Promise.all([User.findById(req.params.id).lean(),UserProfile.findOne({userId:req.params.id}).lean(),Wallet.findOne({userId:req.params.id}).lean(),Subscription.find({userId:req.params.id}).sort({createdAt:-1}).lean(),LeagueEntry.find({userId:req.params.id}).populate('leagueId','name competitionType status').sort({joinedAt:-1}).lean(),Transaction.find({userId:req.params.id}).sort({createdAt:-1}).limit(200).lean()]); if(!user)return failure(res,404,'User not found.'); return success(res,{user,profile,wallet,subscriptions,entries,transactions});}catch(error){next(error);}});
 app.patch('/api/admin/users/:id/status', requireAdmin, writeLimiter, async(req,res,next)=>{try{if(!['active','suspended','closed'].includes(req.body.status))return failure(res,400,'Invalid user status.'); const user=await User.findOneAndUpdate({_id:req.params.id,role:'user'},{$set:{status:req.body.status}},{new:true}); if(!user)return failure(res,404,'User not found.'); await adminAudit(req,'user.status.updated','User',user._id,{status:req.body.status}); return success(res,{user:adminPublicUser(user)});}catch(error){next(error);}});
+
+// Cancels a subscription that was created too late for the cycle it targeted
+// (e.g. a league joined after its cutoff) and refunds the paid amount back to
+// the member's Supreme wallet as a completed 'refund' transaction. Sends the
+// member a branded email confirming the cancellation and refund.
+app.post('/api/admin/subscriptions/:id/cancel-refund', requireAdmin, writeLimiter, async (req, res, next) => {
+  try {
+    const subscription = await Subscription.findById(req.params.id);
+    if (!subscription) return failure(res, 404, 'Subscription not found.');
+    if (subscription.status === 'cancelled') return failure(res, 409, 'This subscription has already been cancelled.');
+
+    const reason = String(req.body.reason || '').trim().slice(0, 500);
+    if (!reason) return failure(res, 400, 'Provide a reason for cancelling this subscription.');
+
+    const originalAmountCents = Number(subscription.amountCents || 0);
+    const requestedRefundCents = req.body.refundAmountCents !== undefined
+      ? Math.round(Number(req.body.refundAmountCents))
+      : originalAmountCents;
+    if (!Number.isFinite(requestedRefundCents) || requestedRefundCents < 0 || requestedRefundCents > originalAmountCents) {
+      return failure(res, 400, `Refund amount must be between $0.00 and $${(originalAmountCents / 100).toFixed(2)}.`);
+    }
+
+    const now = new Date();
+    subscription.status = 'cancelled';
+    subscription.endDate = now;
+    subscription.validUntil = now;
+    subscription.lastValidityCheckAt = now;
+    subscription.cancelledAt = now;
+    subscription.cancelledBy = req.user._id;
+    subscription.cancellationReason = reason;
+    await subscription.save();
+
+    let transaction = null;
+    if (requestedRefundCents > 0) {
+      const reference = createReference('ADMR');
+      transaction = await Transaction.create({
+        userId: subscription.userId,
+        subscriptionId: subscription._id,
+        reference,
+        type: 'refund',
+        direction: 'credit',
+        amountCents: requestedRefundCents,
+        currency: 'USD',
+        provider: 'admin',
+        status: 'completed',
+        description: `${subscription.planName || 'Subscription'} cancelled by admin — refunded to wallet`,
+        metadata: { reason, adminId: String(req.user._id), subscriptionId: String(subscription._id) },
+      });
+      await updateWalletBalances(
+        subscription.userId,
+        {
+          availableBalanceCents: requestedRefundCents,
+          lifetimeSubscriptionFeesCents: -requestedRefundCents,
+          lifetimeRefundsCents: requestedRefundCents,
+        },
+        `Subscription cancelled by admin — refunded ${reference}`,
+        'adminCancelSubscriptionRefund',
+        {},
+        `${reference}:admin-credit`
+      );
+      await emailService.notifyAdminWalletAdjustment(transaction);
+    }
+
+    await adminAudit(req, 'subscription.cancelled.refunded', 'Subscription', subscription._id, {
+      reason,
+      refundCents: requestedRefundCents,
+      userId: String(subscription.userId),
+    });
+
+    const wallet = await Wallet.findOne({ userId: subscription.userId }).lean();
+    return success(res, { subscription: subscription.toObject(), wallet, transaction });
+  } catch (error) { next(error); }
+});
+
+// Ad-hoc wallet credit used, for example, to compensate members who upgraded
+// or replaced a subscription/league entry for the price difference. Creates a
+// completed 'adjustment' transaction, credits the wallet, and emails the member.
+app.post('/api/admin/users/:id/wallet/credit', requireAdmin, writeLimiter, async (req, res, next) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) return failure(res, 404, 'User not found.');
+
+    const reason = String(req.body.reason || '').trim().slice(0, 500);
+    if (!reason) return failure(res, 400, 'Provide a reason for this wallet credit.');
+
+    const amountCents = Math.round(Number(req.body.amountCents));
+    if (!Number.isFinite(amountCents) || amountCents <= 0) {
+      return failure(res, 400, 'Provide a credit amount greater than $0.00.');
+    }
+
+    await ensureUserResources(user._id);
+    const reference = createReference('ADMC');
+    const transaction = await Transaction.create({
+      userId: user._id,
+      reference,
+      type: 'adjustment',
+      direction: 'credit',
+      amountCents,
+      currency: 'USD',
+      provider: 'admin',
+      status: 'completed',
+      description: `Wallet credited by admin — ${reason}`,
+      metadata: { reason, adminId: String(req.user._id) },
+    });
+
+    await updateWalletBalances(
+      user._id,
+      { availableBalanceCents: amountCents, lifetimeAdjustmentsCents: amountCents },
+      `Admin wallet credit ${reference}`,
+      'adminCreditWallet',
+      {},
+      `${reference}:admin-credit`
+    );
+
+    await emailService.notifyAdminWalletAdjustment(transaction);
+    await adminAudit(req, 'wallet.credited', 'User', user._id, { amountCents, reason });
+
+    const wallet = await Wallet.findOne({ userId: user._id }).lean();
+    return success(res, { wallet, transaction });
+  } catch (error) { next(error); }
+});
 
 app.get('/api/admin/transactions', requireAdmin, async (req, res, next) => {
   try {

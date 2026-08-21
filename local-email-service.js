@@ -399,6 +399,38 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
     return customerNotification;
   }
 
+  async function notifyAdminWalletAdjustment(transaction) {
+    if (!transaction) return null;
+    const user = await User.findById(transaction.userId).lean();
+    if (!user) return null;
+    const isRefund = transaction.type === 'refund';
+    const reasonNote = String(transaction.metadata?.reason || '').trim() || transaction.description;
+
+    return sendBrandedEmail({
+      user,
+      eventType: isRefund ? 'wallet.admin-refund' : 'wallet.admin-credit',
+      dedupeKey: `wallet-adjustment:${transaction.reference}`,
+      subject: isRefund
+        ? `You've been refunded ${formatUsd(transaction.amountCents)} to your Supreme wallet`
+        : `Your Supreme wallet was credited ${formatUsd(transaction.amountCents)}`,
+      eyebrow: isRefund ? 'Refund issued' : 'Wallet credit',
+      title: isRefund ? 'Your subscription was cancelled and refunded' : 'Your wallet balance was adjusted',
+      intro: isRefund
+        ? `An administrator cancelled your subscription and credited ${formatUsd(transaction.amountCents)} back to your Supreme wallet.`
+        : `An administrator credited ${formatUsd(transaction.amountCents)} to your Supreme wallet.`,
+      content: detailRows([
+        { label: 'Amount credited', value: formatUsd(transaction.amountCents) },
+        { label: 'Reason', value: reasonNote },
+        { label: 'Reference', value: transaction.reference },
+        { label: 'Date', value: formatDateTime(transaction.updatedAt || transaction.createdAt || new Date()) },
+      ]),
+      actionLabel: 'View wallet',
+      actionUrl: appLink('/app/wallet'),
+      footerNote: 'This adjustment was made by a Supreme Fantasy League administrator. Contact support inside the app if anything here looks unexpected.',
+      metadata: { transactionId: transaction._id, reference: transaction.reference },
+    });
+  }
+
   async function notifyLeagueCreated(user, league) {
     return sendBrandedEmail({
       user,
@@ -612,6 +644,7 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
     notifyOwnerUserSignup: safeNotification('notifyOwnerUserSignup', notifyOwnerUserSignup),
     notifyOwnerAdminSignup: safeNotification('notifyOwnerAdminSignup', notifyOwnerAdminSignup),
     notifyPaymentUpdate: safeNotification('notifyPaymentUpdate', notifyPaymentUpdate),
+    notifyAdminWalletAdjustment: safeNotification('notifyAdminWalletAdjustment', notifyAdminWalletAdjustment),
     notifyLeagueCreated: safeNotification('notifyLeagueCreated', notifyLeagueCreated),
     notifyLeagueMembership: safeNotification('notifyLeagueMembership', notifyLeagueMembership),
     notifyLeagueOutcomes: safeNotification('notifyLeagueOutcomes', notifyLeagueOutcomes),
