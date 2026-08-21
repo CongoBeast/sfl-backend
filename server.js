@@ -1270,6 +1270,27 @@ function utcMonthKey(value) {
   return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
+// Best-effort boundary for monthly-billed plans when the live FPL fixture calendar
+// can't be consulted (FPL_DATA_MODE is "mock", or the FPL API is unreachable). This
+// still anchors the expiry to the UTC calendar month the subscription was purchased
+// for — the first moment of the following month — instead of a flat N-day rolling
+// window from the purchase date. It is intentionally independent of FPL_DATA_MODE so
+// that billing periods stay calendar-correct even when gameplay data is mocked.
+function monthlyCalendarBoundaryWindow(startDate) {
+  const anchor = new Date(startDate);
+  if (Number.isNaN(anchor.getTime())) throw new Error('Monthly subscription start date is invalid.');
+  const targetYear = anchor.getUTCFullYear();
+  const targetMonth = anchor.getUTCMonth();
+  const validUntil = new Date(Date.UTC(targetYear, targetMonth + 1, 1, 0, 0, 0, 0));
+  return {
+    monthlyCycleKey: `${targetYear}-${String(targetMonth + 1).padStart(2, '0')}`,
+    startGameweek: null,
+    validThroughGameweek: null,
+    validUntil,
+    cycleFinished: validUntil <= new Date(),
+  };
+}
+
 function monthlySubscriptionWindowFromBootstrap(startDate, bootstrap) {
   const anchor = new Date(startDate);
   if (Number.isNaN(anchor.getTime())) throw new Error('Monthly subscription start date is invalid.');
@@ -1336,7 +1357,25 @@ async function subscriptionDates(plan, startDate = new Date()) {
     validThroughGameweek: null,
   };
 
-  if (plan?.planCode !== PLAN_CODES.MONTHLY || FPL_DATA_MODE !== 'public') return fallback;
+  // A monthly-billed plan must always lapse at the end of the calendar month it was
+  // purchased for, never a flat validityDays window from the purchase timestamp
+  // (that was the source of subscriptions "lapsing a month after the sub" no matter
+  // where in the month they were bought). This applies regardless of FPL_DATA_MODE,
+  // since billing-cycle boundaries are a real-world calendar concept even when
+  // gameplay data is mocked for testing.
+  if (plan?.billingInterval !== 'monthly') return fallback;
+
+  const calendarWindow = monthlyCalendarBoundaryWindow(startDate);
+  const calendarFallback = {
+    ...fallback,
+    validUntil: calendarWindow.validUntil,
+    endDate: calendarWindow.validUntil,
+    renewalDate: calendarWindow.validUntil,
+    monthlyCycleKey: calendarWindow.monthlyCycleKey,
+    validThroughGameweek: null,
+  };
+
+  if (FPL_DATA_MODE !== 'public') return calendarFallback;
 
   try {
     const bootstrap = await fetchFplJson('/bootstrap-static/', { cacheMinutes: 5 });
@@ -1350,22 +1389,31 @@ async function subscriptionDates(plan, startDate = new Date()) {
       validThroughGameweek: window.validThroughGameweek,
     };
   } catch (error) {
-    // Do not fail a paid checkout just because FPL is temporarily unavailable.
-    // Daily maintenance will reconcile the date once the provider recovers.
+    // Fall back to the pure calendar-month boundary, not the flat validityDays
+    // window, so the subscription still lapses at month-end even when FPL is
+    // temporarily unreachable. Daily maintenance will re-align it to the precise
+    // fixture deadline once the provider recovers.
     console.warn('Monthly subscription schedule fallback used:', error.message);
-    return fallback;
+    return calendarFallback;
   }
 }
 
 async function reconcileMonthlySubscriptionWindows({ userId = null } = {}) {
-  if (FPL_DATA_MODE !== 'public') {
-    return { skipped: true, reason: 'fpl-data-mode-not-public', checked: 0, corrected: 0, reactivated: 0, expired: 0 };
-  }
-
+  // Runs regardless of FPL_DATA_MODE: billing-cycle boundaries are a calendar
+  // concept, not gameplay data, so mocked deployments must still reconcile monthly
+  // subscriptions to a month-end boundary instead of skipping entirely (which left
+  // subscriptions created under the old flat validityDays window uncorrected).
   const now = new Date();
-  const bootstrap = await fetchFplJson('/bootstrap-static/', { cacheMinutes: 5 });
+  let bootstrap = null;
+  if (FPL_DATA_MODE === 'public') {
+    try {
+      bootstrap = await fetchFplJson('/bootstrap-static/', { cacheMinutes: 5 });
+    } catch (error) {
+      console.warn('Monthly subscription reconciliation: FPL fixtures unavailable, using calendar-month fallback:', error.message);
+    }
+  }
   const query = {
-    planCode: PLAN_CODES.MONTHLY,
+    billingInterval: 'monthly',
     status: { $in: ['active', 'expired'] },
     ...(userId ? { userId } : {}),
   };
@@ -1380,7 +1428,15 @@ async function reconcileMonthlySubscriptionWindows({ userId = null } = {}) {
   for (const subscription of subscriptions) {
     try {
       const anchor = subscription.activatedAt || subscription.startDate || subscription.createdAt;
-      const window = monthlySubscriptionWindowFromBootstrap(anchor, bootstrap);
+      let window;
+      try {
+        window = bootstrap
+          ? monthlySubscriptionWindowFromBootstrap(anchor, bootstrap)
+          : monthlyCalendarBoundaryWindow(anchor);
+      } catch (windowError) {
+        // e.g. an off-season anchor month with no upcoming FPL gameweek yet.
+        window = monthlyCalendarBoundaryWindow(anchor);
+      }
       const timeBoundaryPassed = window.validUntil <= now;
       const shouldBeExpired = window.cycleFinished || timeBoundaryPassed;
 
