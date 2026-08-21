@@ -614,6 +614,21 @@ const auditLogSchema = new Schema({
 }, { timestamps: { createdAt: true, updatedAt: false } });
 
 
+
+const maintenanceRunSchema = new Schema({
+  _id: { type: String, required: true },
+  runKey: { type: String, required: true, index: true },
+  schedule: { type: String, default: 'daily' },
+  scheduledForUtc: { type: Date, required: true },
+  status: { type: String, enum: ['running', 'completed', 'failed'], default: 'running', index: true },
+  startedAt: { type: Date, default: Date.now },
+  completedAt: { type: Date, default: null },
+  failedAt: { type: Date, default: null },
+  tasks: { type: [String], default: [] },
+  summary: { type: Schema.Types.Mixed, default: {} },
+  error: { type: String, default: '' },
+}, { timestamps: true });
+
 const supportTicketSchema = new Schema({
   userId: { type: Schema.Types.ObjectId, ref: 'User', default: null, index: true },
   ticketNumber: { type: String, required: true, unique: true, index: true },
@@ -645,6 +660,7 @@ const Subscription = mongoose.model('Subscription', subscriptionSchema);
 const TeamSnapshot = mongoose.model('TeamSnapshot', teamSnapshotSchema);
 const AuditLog = mongoose.model('AuditLog', auditLogSchema);
 const SupportTicket = mongoose.model('SupportTicket', supportTicketSchema);
+const MaintenanceRun = mongoose.model('MaintenanceRun', maintenanceRunSchema);
 
 const { createLocalEmailService } = require('./local-email-service');
 const emailService = createLocalEmailService({
@@ -4148,6 +4164,12 @@ app.post('/api/internal/local/team-reminders', requireAdmin, writeLimiter, async
   } catch (error) { next(error); }
 });
 
+app.post('/api/internal/local/user-email-reminders', requireAdmin, writeLimiter, async (req, res, next) => {
+  try {
+    return success(res, await localGrowth.sendScheduledUserEmails());
+  } catch (error) { next(error); }
+});
+
 // -----------------------------------------------------------------------------
 // Administration API
 // -----------------------------------------------------------------------------
@@ -4158,6 +4180,187 @@ const pageOptions = (req, fallback = 25) => ({
   page: Math.max(1, Number(req.query.page || 1)),
   limit: clamp(Number(req.query.limit || fallback), 1, 100),
 });
+
+function parseAdminAnalyticsRange(req) {
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+
+  // Default to 30 calendar months including the current month.
+  const defaultFrom = new Date(Date.UTC(
+    todayStart.getUTCFullYear(),
+    todayStart.getUTCMonth() - 29,
+    1
+  ));
+
+  const rawFrom = req.query.from ? new Date(String(req.query.from)) : defaultFrom;
+  const rawTo = req.query.to
+    ? new Date(String(req.query.to))
+    : new Date(todayStart.getTime() + 86400000);
+
+  const from = Number.isNaN(rawFrom.getTime()) ? defaultFrom : rawFrom;
+  let toExclusive = Number.isNaN(rawTo.getTime())
+    ? new Date(todayStart.getTime() + 86400000)
+    : rawTo;
+
+  // Date-only `to` values are interpreted as inclusive by the admin UI.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(req.query.to || ''))) {
+    toExclusive = new Date(toExclusive.getTime() + 86400000);
+  }
+
+  if (toExclusive <= from) {
+    toExclusive = new Date(from.getTime() + 86400000);
+  }
+
+  // Prevent accidental very large analytics queries. The maximum is 30
+  // calendar months, measured backwards from the selected end date.
+  const maxFrom = new Date(Date.UTC(
+    toExclusive.getUTCFullYear(),
+    toExclusive.getUTCMonth() - 29,
+    1
+  ));
+  if (from < maxFrom) return { from: maxFrom, toExclusive };
+
+  return { from, toExclusive };
+}
+
+function adminCashInMatch() {
+  return {
+    status: 'completed',
+    provider: { $in: ['paynow', 'mock'] },
+    type: { $in: ['deposit', 'subscription', 'entry-fee'] },
+    direction: 'credit',
+  };
+}
+
+function adminRevenueMatch() {
+  return {
+    status: 'completed',
+    type: { $in: ['subscription', 'entry-fee', 'platform-fee'] },
+    direction: 'credit',
+  };
+}
+
+function adminBucketStart(date, groupBy) {
+  const value = new Date(date);
+  if (groupBy === 'month') return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), 1));
+  if (groupBy === 'week') {
+    const day = value.getUTCDay();
+    const mondayOffset = (day + 6) % 7;
+    return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate() - mondayOffset));
+  }
+  return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()));
+}
+
+function adminBucketKey(date, groupBy) {
+  return adminBucketStart(date, groupBy).toISOString().slice(0, 10);
+}
+
+function nextAdminBucket(date, groupBy) {
+  const value = new Date(date);
+  if (groupBy === 'month') return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth() + 1, 1));
+  return new Date(value.getTime() + (groupBy === 'week' ? 7 : 1) * 86400000);
+}
+
+async function getAdminDashboardAnalytics(req) {
+  const { from, toExclusive } = parseAdminAnalyticsRange(req);
+  const groupBy = ['day', 'week', 'month'].includes(String(req.query.groupBy || '').toLowerCase())
+    ? String(req.query.groupBy).toLowerCase()
+    : 'month';
+
+  const dateMatch = { createdAt: { $gte: from, $lt: toExclusive } };
+  const [signupDaily, cashInDaily, filteredCashIn, lifetimeCashIn, lifetimeRevenue, filteredRevenue] = await Promise.all([
+    User.aggregate([
+      { $match: { role: 'user', ...dateMatch } },
+      { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'UTC' } }, count: { $sum: 1 } } },
+      { $sort: { _id: 1 } },
+    ]),
+    Transaction.aggregate([
+      { $match: adminCashInMatch() },
+      { $addFields: { settlementDate: { $ifNull: ['$metadata.finalizedAt', '$updatedAt'] } } },
+      { $match: { settlementDate: { $gte: from, $lt: toExclusive } } },
+      { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$settlementDate', timezone: 'UTC' } }, amountCents: { $sum: '$amountCents' }, count: { $sum: 1 } } },
+      { $sort: { _id: 1 } },
+    ]),
+    Transaction.aggregate([
+      { $match: adminCashInMatch() },
+      { $addFields: { settlementDate: { $ifNull: ['$metadata.finalizedAt', '$updatedAt'] } } },
+      { $match: { settlementDate: { $gte: from, $lt: toExclusive } } },
+      { $group: { _id: null, amountCents: { $sum: '$amountCents' }, count: { $sum: 1 } } },
+    ]),
+    Transaction.aggregate([
+      { $match: adminCashInMatch() },
+      { $group: { _id: null, amountCents: { $sum: '$amountCents' }, count: { $sum: 1 } } },
+    ]),
+    Transaction.aggregate([
+      { $match: adminRevenueMatch() },
+      { $group: { _id: null, amountCents: { $sum: '$amountCents' }, count: { $sum: 1 } } },
+    ]),
+    Transaction.aggregate([
+      { $match: adminRevenueMatch() },
+      { $addFields: { settlementDate: { $ifNull: ['$metadata.finalizedAt', '$updatedAt'] } } },
+      { $match: { settlementDate: { $gte: from, $lt: toExclusive } } },
+      { $group: { _id: null, amountCents: { $sum: '$amountCents' }, count: { $sum: 1 } } },
+    ]),
+  ]);
+
+  const signupMap = new Map(signupDaily.map((item) => [item._id, Number(item.count || 0)]));
+  const cashMap = new Map(cashInDaily.map((item) => [item._id, { amountCents: Number(item.amountCents || 0), count: Number(item.count || 0) }]));
+  const buckets = [];
+  let cursor = adminBucketStart(from, groupBy);
+  while (cursor < toExclusive) {
+    const next = nextAdminBucket(cursor, groupBy);
+    buckets.push({ start: cursor, end: next });
+    cursor = next;
+  }
+
+  const series = buckets.map((bucket) => {
+    let userSignups = 0;
+    let cashInCents = 0;
+    let cashInCount = 0;
+    for (const [key, count] of signupMap.entries()) {
+      const day = new Date(`${key}T00:00:00.000Z`);
+      if (day >= bucket.start && day < bucket.end) userSignups += count;
+    }
+    for (const [key, value] of cashMap.entries()) {
+      const day = new Date(`${key}T00:00:00.000Z`);
+      if (day >= bucket.start && day < bucket.end) {
+        cashInCents += value.amountCents;
+        cashInCount += value.count;
+      }
+    }
+    return {
+      key: bucket.start.toISOString().slice(0, 10),
+      label: groupBy === 'month'
+        ? bucket.start.toLocaleString('en-GB', { month: 'short', year: 'numeric', timeZone: 'UTC' })
+        : groupBy === 'week'
+          ? `Week of ${bucket.start.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', timeZone: 'UTC' })}`
+          : bucket.start.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', timeZone: 'UTC' }),
+      start: bucket.start.toISOString(),
+      end: bucket.end.toISOString(),
+      userSignups,
+      cashInCents,
+      cashInCount,
+    };
+  });
+
+  return {
+    range: { from: from.toISOString(), to: new Date(toExclusive.getTime() - 1).toISOString(), groupBy },
+    totals: {
+      userSignups: signupDaily.reduce((sum, item) => sum + Number(item.count || 0), 0),
+      cashInCents: Number(filteredCashIn[0]?.amountCents || 0),
+      cashInCount: Number(filteredCashIn[0]?.count || 0),
+      revenueCents: Number(filteredRevenue[0]?.amountCents || 0),
+      lifetimeCashInCents: Number(lifetimeCashIn[0]?.amountCents || 0),
+      lifetimeCashInCount: Number(lifetimeCashIn[0]?.count || 0),
+      lifetimeRevenueCents: Number(lifetimeRevenue[0]?.amountCents || 0),
+    },
+    series,
+    definitions: {
+      cashIn: 'Completed external Paynow/mock deposits, subscriptions and league entries. Wallet-funded purchases are excluded so they are not counted twice.',
+      revenue: 'Completed subscription, league-entry and platform-fee transactions, including wallet-funded purchases.',
+    },
+  };
+}
 
 function requireAdmin(req, res, next) {
   return requireAuth(req, res, () => {
@@ -4207,17 +4410,48 @@ app.get('/api/admin/session', requireAdmin, (req, res) => success(res, { admin: 
 
 app.get('/api/admin/dashboard', requireAdmin, async (req, res, next) => {
   try {
-    const monthStart = new Date(); monthStart.setUTCDate(1); monthStart.setUTCHours(0,0,0,0);
-    const [users, newUsers, activeSubscriptions, usersInLeagues, leagueGroups, activeLeagues, finance, openTickets] = await Promise.all([
-      User.countDocuments({ role: 'user' }), User.countDocuments({ role: 'user', createdAt: { $gte: monthStart } }), Subscription.countDocuments({ status: 'active' }), LeagueEntry.distinct('userId').then(x => x.length),
-      League.aggregate([{ $group: { _id: '$competitionType', count: { $sum: 1 } } }, { $sort: { count: -1 } }]), League.countDocuments({ status: { $in: ['open','upcoming','live'] } }),
-      Transaction.aggregate([{ $match: { status: 'completed' } }, { $group: { _id: { type: '$type', direction: '$direction' }, amountCents: { $sum: '$amountCents' }, count: { $sum: 1 } } }]),
-      SupportTicket.countDocuments({ status: { $nin: ['resolved','closed'] } }),
+    const monthStart = new Date(); monthStart.setUTCDate(1); monthStart.setUTCHours(0, 0, 0, 0);
+    const [users, newUsers, activeSubscriptions, usersInLeagues, leagueGroups, activeLeagues, finance, openTickets, analytics] = await Promise.all([
+      User.countDocuments({ role: 'user' }),
+      User.countDocuments({ role: 'user', createdAt: { $gte: monthStart } }),
+      Subscription.countDocuments({ status: 'active' }),
+      LeagueEntry.distinct('userId').then((x) => x.length),
+      League.aggregate([{ $group: { _id: '$competitionType', count: { $sum: 1 } } }, { $sort: { count: -1 } }]),
+      League.countDocuments({ status: { $in: ['open', 'upcoming', 'live'] } }),
+      Transaction.aggregate([{ $match: { status: 'completed' } }, { $group: { _id: { type: '$type', direction: '$direction', provider: '$provider' }, amountCents: { $sum: '$amountCents' }, count: { $sum: 1 } } }]),
+      SupportTicket.countDocuments({ status: { $nin: ['resolved', 'closed'] } }),
+      getAdminDashboardAnalytics(req),
     ]);
-    const revenueTypes = new Set(['subscription','entry-fee','platform-fee','deposit']);
-    const revenueCents = finance.filter(x => x._id.direction === 'credit' && revenueTypes.has(x._id.type)).reduce((s,x)=>s+x.amountCents,0);
-    const payoutsDueCents = await Transaction.aggregate([{ $match: { type: { $in: ['withdrawal','prize'] }, status: { $in: ['pending','processing'] } } }, { $group: { _id: null, total: { $sum: '$amountCents' } } }]).then(x=>x[0]?.total||0);
-    return success(res, { users, newUsers, activeSubscriptions, usersInLeagues, leagues: { total: leagueGroups.reduce((s,x)=>s+x.count,0), active: activeLeagues, byType: leagueGroups }, finances: { revenueCents, payoutsDueCents, breakdown: finance }, openTickets });
+    const payoutsDueCents = await Transaction.aggregate([
+      { $match: { type: { $in: ['withdrawal', 'prize'] }, status: { $in: ['pending', 'processing'] } } },
+      { $group: { _id: null, total: { $sum: '$amountCents' } } },
+    ]).then((x) => x[0]?.total || 0);
+    return success(res, {
+      users,
+      newUsers,
+      activeSubscriptions,
+      usersInLeagues,
+      leagues: { total: leagueGroups.reduce((sum, item) => sum + item.count, 0), active: activeLeagues, byType: leagueGroups },
+      finances: {
+        // Dashboard financial figures use the default 30-calendar-month
+        // reporting window rather than an arbitrary current-month slice.
+        revenueCents: analytics.totals.revenueCents,
+        cashInCents: analytics.totals.cashInCents,
+        collectedCents: analytics.totals.cashInCents,
+        lifetimeRevenueCents: analytics.totals.lifetimeRevenueCents,
+        lifetimeCashInCents: analytics.totals.lifetimeCashInCents,
+        payoutsDueCents,
+        breakdown: finance,
+      },
+      analytics,
+      openTickets,
+    });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/admin/dashboard/analytics', requireAdmin, async (req, res, next) => {
+  try {
+    return success(res, await getAdminDashboardAnalytics(req));
   } catch (error) { next(error); }
 });
 
@@ -4292,7 +4526,170 @@ app.get('/api/admin/users', requireAdmin, async(req,res,next)=>{try{
 app.get('/api/admin/users/:id', requireAdmin, async(req,res,next)=>{try{const [user,profile,wallet,subscriptions,entries,transactions]=await Promise.all([User.findById(req.params.id).lean(),UserProfile.findOne({userId:req.params.id}).lean(),Wallet.findOne({userId:req.params.id}).lean(),Subscription.find({userId:req.params.id}).sort({createdAt:-1}).lean(),LeagueEntry.find({userId:req.params.id}).populate('leagueId','name competitionType status').sort({joinedAt:-1}).lean(),Transaction.find({userId:req.params.id}).sort({createdAt:-1}).limit(200).lean()]); if(!user)return failure(res,404,'User not found.'); return success(res,{user,profile,wallet,subscriptions,entries,transactions});}catch(error){next(error);}});
 app.patch('/api/admin/users/:id/status', requireAdmin, writeLimiter, async(req,res,next)=>{try{if(!['active','suspended','closed'].includes(req.body.status))return failure(res,400,'Invalid user status.'); const user=await User.findOneAndUpdate({_id:req.params.id,role:'user'},{$set:{status:req.body.status}},{new:true}); if(!user)return failure(res,404,'User not found.'); await adminAudit(req,'user.status.updated','User',user._id,{status:req.body.status}); return success(res,{user:adminPublicUser(user)});}catch(error){next(error);}});
 
-app.get('/api/admin/transactions', requireAdmin, async(req,res,next)=>{try{const {page,limit}=pageOptions(req,50); const filter={}; if(req.query.type)filter.type=req.query.type;if(req.query.status)filter.status=req.query.status;if(req.query.provider)filter.provider=req.query.provider;if(req.query.direction)filter.direction=req.query.direction;if(req.query.minAmount)filter.amountCents={...(filter.amountCents||{}),$gte:Math.round(Number(req.query.minAmount)*100)};if(req.query.maxAmount)filter.amountCents={...(filter.amountCents||{}),$lte:Math.round(Number(req.query.maxAmount)*100)};if(req.query.search)filter.$or=[{reference:new RegExp(escapeRegex(req.query.search),'i')},{description:new RegExp(escapeRegex(req.query.search),'i')}]; const [rows,total]=await Promise.all([Transaction.find(filter).populate('userId','fullName email phone').populate('leagueId','name').sort({createdAt:-1}).skip((page-1)*limit).limit(limit).lean(),Transaction.countDocuments(filter)]); const summary=await Transaction.aggregate([{ $match:{}},{ $group:{_id:{type:'$type',status:'$status',provider:'$provider',direction:'$direction'},amountCents:{$sum:'$amountCents'},count:{$sum:1}}}]);return success(res,{rows,summary,pagination:{page,limit,total,pages:Math.ceil(total/limit)}});}catch(error){next(error);}});
+app.get('/api/admin/transactions', requireAdmin, async (req, res, next) => {
+  try {
+    const { page, limit } = pageOptions(req, 50);
+    const { from, toExclusive } = parseAdminAnalyticsRange(req);
+    const filter = {
+      createdAt: { $gte: from, $lt: toExclusive },
+    };
+
+    if (req.query.type) filter.type = req.query.type;
+    if (req.query.status) filter.status = req.query.status;
+    if (req.query.provider) filter.provider = req.query.provider;
+    if (req.query.direction) filter.direction = req.query.direction;
+
+    if (req.query.minAmount) {
+      filter.amountCents = {
+        ...(filter.amountCents || {}),
+        $gte: Math.round(Number(req.query.minAmount) * 100),
+      };
+    }
+
+    if (req.query.maxAmount) {
+      filter.amountCents = {
+        ...(filter.amountCents || {}),
+        $lte: Math.round(Number(req.query.maxAmount) * 100),
+      };
+    }
+
+    if (req.query.search) {
+      filter.$or = [
+        { reference: new RegExp(escapeRegex(req.query.search), 'i') },
+        { description: new RegExp(escapeRegex(req.query.search), 'i') },
+      ];
+    }
+
+    // Period totals intentionally ignore row-level filters such as search,
+    // purpose and provider. The date range is the reporting boundary, so the
+    // admin can filter the transaction table without making money disappear
+    // from the headline cash/revenue figures.
+
+    const [rows, total, summary, cashIn, revenue, revenueBreakdown, payoutsDue] = await Promise.all([
+      Transaction.find(filter)
+        .populate('userId', 'fullName email phone')
+        .populate('leagueId', 'name')
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      Transaction.countDocuments(filter),
+      Transaction.aggregate([
+        { $match: filter },
+        {
+          $group: {
+            _id: {
+              type: '$type',
+              status: '$status',
+              provider: '$provider',
+              direction: '$direction',
+            },
+            amountCents: { $sum: '$amountCents' },
+            count: { $sum: 1 },
+          },
+        },
+      ]),
+      Transaction.aggregate([
+        { $match: adminCashInMatch() },
+        {
+          $addFields: {
+            settlementDate: { $ifNull: ['$metadata.finalizedAt', '$updatedAt'] },
+          },
+        },
+        { $match: { settlementDate: { $gte: from, $lt: toExclusive } } },
+        {
+          $group: {
+            _id: null,
+            amountCents: { $sum: '$amountCents' },
+            count: { $sum: 1 },
+          },
+        },
+      ]),
+      Transaction.aggregate([
+        { $match: adminRevenueMatch() },
+        {
+          $addFields: {
+            settlementDate: { $ifNull: ['$metadata.finalizedAt', '$updatedAt'] },
+          },
+        },
+        { $match: { settlementDate: { $gte: from, $lt: toExclusive } } },
+        {
+          $group: {
+            _id: null,
+            amountCents: { $sum: '$amountCents' },
+            count: { $sum: 1 },
+          },
+        },
+      ]),
+      Transaction.aggregate([
+        { $match: adminRevenueMatch() },
+        {
+          $addFields: {
+            settlementDate: { $ifNull: ['$metadata.finalizedAt', '$updatedAt'] },
+          },
+        },
+        { $match: { settlementDate: { $gte: from, $lt: toExclusive } } },
+        {
+          $group: {
+            _id: '$type',
+            amountCents: { $sum: '$amountCents' },
+            count: { $sum: 1 },
+          },
+        },
+      ]),
+      Transaction.aggregate([
+        {
+          $match: {
+            type: { $in: ['withdrawal', 'prize'] },
+            status: { $in: ['pending', 'processing'] },
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            amountCents: { $sum: '$amountCents' },
+            count: { $sum: 1 },
+          },
+        },
+      ]),
+    ]);
+
+    return success(res, {
+      rows,
+      summary,
+      cashIn: {
+        amountCents: Number(cashIn[0]?.amountCents || 0),
+        count: Number(cashIn[0]?.count || 0),
+      },
+      revenue: {
+        amountCents: Number(revenue[0]?.amountCents || 0),
+        count: Number(revenue[0]?.count || 0),
+      },
+      revenueBreakdown: revenueBreakdown.map((item) => ({
+        type: item._id,
+        amountCents: Number(item.amountCents || 0),
+        count: Number(item.count || 0),
+      })),
+      payoutsDue: {
+        amountCents: Number(payoutsDue[0]?.amountCents || 0),
+        count: Number(payoutsDue[0]?.count || 0),
+      },
+      range: {
+        from: from.toISOString(),
+        to: new Date(toExclusive.getTime() - 1).toISOString(),
+      },
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/api/admin/transactions/:id', requireAdmin, async(req,res,next)=>{try{const transaction=await Transaction.findById(req.params.id).populate('userId','fullName email phone').populate('leagueId','name competitionType').populate('subscriptionId').lean();if(!transaction)return failure(res,404,'Transaction not found.');return success(res,{transaction});}catch(error){next(error);}});
 app.patch('/api/admin/withdrawals/:id/status', requireAdmin, writeLimiter, async (req, res, next) => {
   try {
@@ -4513,6 +4910,7 @@ const localGrowth = (() => {
     
       const {
         User,
+        UserProfile,
         Wallet,
         Transaction,
         Subscription,
@@ -4664,6 +5062,244 @@ const localGrowth = (() => {
         }
       }
     
+      function configuredDayList(name, fallback) {
+        const raw = String(process.env[name] || fallback);
+        return [...new Set(raw.split(',').map((value) => Number.parseInt(value.trim(), 10)).filter((value) => Number.isInteger(value) && value >= 1 && value <= 14))];
+      }
+
+      function utcDayStart(value = new Date()) {
+        const date = new Date(value);
+        return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+      }
+
+      function calendarDaysBetween(later, earlier) {
+        return Math.round((utcDayStart(later).getTime() - utcDayStart(earlier).getTime()) / 86400000);
+      }
+
+      async function userEmailNotificationsAllowed(userId, preferenceKey = '') {
+        if (!UserProfile) return true;
+        const profile = await UserProfile.findOne({ userId }).select('notificationPreferences').lean();
+        const preferences = profile?.notificationPreferences || {};
+        if (preferences.emailNotifications === false) return false;
+        if (preferenceKey && preferences[preferenceKey] === false) return false;
+        return true;
+      }
+
+      async function sendAccountSetupReminders(now = new Date()) {
+        const afterHours = Math.max(1, Number(process.env.ACCOUNT_SETUP_REMINDER_AFTER_HOURS || 24));
+        const repeatDays = Math.max(1, Number(process.env.ACCOUNT_SETUP_REMINDER_REPEAT_DAYS || 3));
+        const cutoff = new Date(now.getTime() - afterHours * 3600000);
+        const users = await User.find({
+          role: 'user',
+          status: 'active',
+          createdAt: { $lte: cutoff },
+          email: { $exists: true, $ne: '' },
+        }).select('_id fullName email fplManagerId createdAt').lean();
+
+        if (!users.length) return { checked: 0, sent: 0, skipped: 0 };
+
+        const userIds = users.map((user) => user._id);
+        const activeSubscriptions = await Subscription.find({
+          userId: { $in: userIds },
+          status: 'active',
+          $or: [
+            { validUntil: { $gt: now } },
+            { validUntil: null, endDate: { $gt: now } },
+            { validUntil: null, endDate: null, renewalDate: { $gt: now } },
+          ],
+        }).select('userId').lean();
+        const subscribed = new Set(activeSubscriptions.map((item) => String(item.userId)));
+
+        let sent = 0;
+        let skipped = 0;
+        for (const user of users) {
+          const hasTeam = Boolean(String(user.fplManagerId || '').trim());
+          const hasSubscription = subscribed.has(String(user._id));
+          if (hasTeam && hasSubscription) continue;
+
+          const ageHours = Math.max(0, (now.getTime() - new Date(user.createdAt).getTime()) / 3600000);
+          if (ageHours < afterHours) continue;
+          const reminderIndex = Math.floor(Math.max(0, ageHours - afterHours) / (repeatDays * 24));
+          const eventKey = `account-setup:${user._id}:${reminderIndex}`;
+
+          if (!(await userEmailNotificationsAllowed(user._id))) {
+            skipped += 1;
+            continue;
+          }
+
+          const steps = [];
+          if (!hasTeam) {
+            steps.push('<li><strong>Link your FPL team:</strong> open the Team page and paste your FPL entry link, for example <code>https://fantasy.premierleague.com/en/entry/1149514/transfers</code>. We extract your manager number automatically.</li>');
+          }
+          if (!hasSubscription) {
+            steps.push('<li><strong>Choose your subscription:</strong> open Subscription and select the plan that matches the competitions you want to enter.</li>');
+            steps.push('<li><strong>Pay:</strong> confirm your payment method, then complete the Paynow checkout or confirm the wallet payment if you have enough balance.</li>');
+          }
+          steps.push('<li><strong>Finish setup:</strong> once your team is linked and your subscription is active, the eligible Supreme leagues are handled automatically by the platform.</li>');
+
+          const destination = !hasTeam ? `${appUrl}/app/team` : `${appUrl}/app/subscription`;
+          const result = await sendEmail({
+            eventKey,
+            userId: user._id,
+            to: user.email,
+            category: 'account-setup',
+            subject: 'ACTION REQUIRED!!!! Complete your Supreme Fantasy League setup',
+            preheader: 'Link your FPL team and activate your subscription before the next competition deadline.',
+            title: 'ACTION REQUIRED — finish setting up your account',
+            tone: 'danger',
+            message: `<p style="margin:0 0 14px;">Hi ${htmlEscape(user.fullName || 'there')}, your Supreme Fantasy League account is registered, but there are still steps required before you can participate fully.</p><ol style="margin:0;padding-left:22px;line-height:1.75;">${steps.join('')}</ol>`,
+            buttonLabel: !hasTeam ? 'Link my FPL team' : 'Complete my subscription',
+            buttonUrl: destination,
+            details: [
+              { label: 'FPL team linked', value: hasTeam ? 'Yes' : 'No' },
+              { label: 'Active subscription', value: hasSubscription ? 'Yes' : 'No' },
+            ],
+            metadata: { hasTeam, hasSubscription, reminderIndex },
+          });
+          if (result?.skipped || result?.error) skipped += 1;
+          else sent += 1;
+        }
+        return { checked: users.length, sent, skipped };
+      }
+
+      async function sendGameweekDeadlineReminders(now = new Date()) {
+        if (FPL_DATA_MODE !== 'public') return { skipped: true, reason: 'fpl-data-mode-not-public', checked: 0, sent: 0 };
+        const reminderDays = configuredDayList('GAMEWEEK_REMINDER_DAYS', '3,2');
+        if (!reminderDays.length) return { skipped: true, reason: 'no-reminder-days-configured', checked: 0, sent: 0 };
+
+        const bootstrap = await fetchFplBootstrap();
+        const events = (Array.isArray(bootstrap?.events) ? bootstrap.events : [])
+          .filter((event) => event?.deadline_time && !event.finished && new Date(event.deadline_time) > now)
+          .sort((a, b) => new Date(a.deadline_time) - new Date(b.deadline_time));
+        const nextEvent = events[0];
+        if (!nextEvent) return { skipped: true, reason: 'no-upcoming-gameweek', checked: 0, sent: 0 };
+
+        const deadline = new Date(nextEvent.deadline_time);
+        const daysBefore = calendarDaysBetween(deadline, now);
+        if (!reminderDays.includes(daysBefore)) return { skipped: true, reason: 'not-a-reminder-day', gameweek: Number(nextEvent.id), daysBefore, checked: 0, sent: 0 };
+
+        const users = await User.find({ role: 'user', status: 'active', email: { $exists: true, $ne: '' } })
+          .select('_id fullName email fplManagerId').lean();
+        if (!users.length) return { checked: 0, sent: 0 };
+        const userIds = users.map((user) => user._id);
+        const subscriptions = await Subscription.find({
+          userId: { $in: userIds },
+          status: 'active',
+          $or: [
+            { validUntil: { $gt: now } },
+            { validUntil: null, endDate: { $gt: now } },
+            { validUntil: null, endDate: null, renewalDate: { $gt: now } },
+          ],
+        }).select('userId planName validUntil').lean();
+        const subscriptionMap = new Map(subscriptions.map((item) => [String(item.userId), item]));
+
+        const formattedDeadline = deadline.toLocaleString('en-GB', {
+          weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'UTC', timeZoneName: 'short',
+        });
+        let sent = 0;
+        let skipped = 0;
+        for (const user of users) {
+          const subscription = subscriptionMap.get(String(user._id));
+          if (!subscription) continue;
+          if (!(await userEmailNotificationsAllowed(user._id, 'deadlineReminders'))) {
+            skipped += 1;
+            continue;
+          }
+          const eventKey = `gameweek-deadline:${nextEvent.id}:${daysBefore}:${user._id}`;
+          const hasTeam = Boolean(String(user.fplManagerId || '').trim());
+          const result = await sendEmail({
+            eventKey,
+            userId: user._id,
+            to: user.email,
+            category: 'gameweek-reminder',
+            subject: `ACTION REQUIRED!!!! Gameweek ${nextEvent.id} deadline is ${daysBefore} day${daysBefore === 1 ? '' : 's'} away`,
+            preheader: `Your Gameweek ${nextEvent.id} deadline is approaching. Make sure your FPL team is ready.`,
+            title: `ACTION REQUIRED — Gameweek ${nextEvent.id} is ${daysBefore} day${daysBefore === 1 ? '' : 's'} away`,
+            tone: 'danger',
+            message: `<p style="margin:0 0 14px;">Hi ${htmlEscape(user.fullName || 'there')}, the next FPL gameweek deadline is approaching. Please make your final team decisions before the deadline.</p><p style="margin:0;">${hasTeam ? 'Your FPL manager is linked. Review your starting XI, captain and transfers before the deadline.' : 'You have not linked an FPL manager yet. Link it now so your Supreme Fantasy League participation can be processed correctly.'}</p>`,
+            buttonLabel: hasTeam ? 'Review my team' : 'Link my FPL team',
+            buttonUrl: hasTeam ? `${appUrl}/app/team` : `${appUrl}/app/team`,
+            details: [
+              { label: 'Gameweek', value: nextEvent.id },
+              { label: 'Deadline', value: formattedDeadline },
+              { label: 'Subscription', value: subscription.planName || 'Active subscription' },
+            ],
+            metadata: { gameweek: Number(nextEvent.id), deadline: deadline.toISOString(), daysBefore },
+          });
+          if (result?.skipped || result?.error) skipped += 1;
+          else sent += 1;
+        }
+        return { skipped: false, gameweek: Number(nextEvent.id), deadline: deadline.toISOString(), daysBefore, checked: users.length, sent, skipped };
+      }
+
+      async function sendSubscriptionLapseReminders(now = new Date()) {
+        const reminderDays = configuredDayList('SUBSCRIPTION_LAPSE_REMINDER_DAYS', '3,1');
+        if (!reminderDays.length) return { skipped: true, reason: 'no-lapse-days-configured', checked: 0, sent: 0 };
+        const maxDays = Math.max(...reminderDays);
+        const upper = new Date(now.getTime() + maxDays * 86400000 + 86400000);
+        const subscriptions = await Subscription.find({
+          status: 'active',
+          validUntil: { $gt: now, $lte: upper },
+        }).select('_id userId planName validUntil').lean();
+        if (!subscriptions.length) return { checked: 0, sent: 0 };
+
+        const users = await User.find({
+          _id: { $in: subscriptions.map((item) => item.userId) },
+          role: 'user',
+          status: 'active',
+          email: { $exists: true, $ne: '' },
+        }).select('_id fullName email').lean();
+        const userMap = new Map(users.map((user) => [String(user._id), user]));
+        let sent = 0;
+        let skipped = 0;
+        for (const subscription of subscriptions) {
+          const user = userMap.get(String(subscription.userId));
+          if (!user) continue;
+          const daysLeft = Math.max(0, Math.ceil((new Date(subscription.validUntil).getTime() - now.getTime()) / 86400000));
+          if (!reminderDays.includes(daysLeft)) continue;
+          if (!(await userEmailNotificationsAllowed(user._id, 'deadlineReminders'))) {
+            skipped += 1;
+            continue;
+          }
+          const eventKey = `subscription-lapse:${subscription._id}:${daysLeft}`;
+          const validUntil = new Date(subscription.validUntil);
+          const result = await sendEmail({
+            eventKey,
+            userId: user._id,
+            to: user.email,
+            category: 'subscription-lapse',
+            subject: `ACTION REQUIRED!!!! Your ${subscription.planName || 'Supreme Fantasy League'} subscription expires in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`,
+            preheader: 'Renew before your subscription expires so you do not lose access to eligible competitions.',
+            title: `ACTION REQUIRED — your subscription is about to lapse`,
+            tone: 'danger',
+            message: `<p style="margin:0 0 14px;">Hi ${htmlEscape(user.fullName || 'there')}, your ${htmlEscape(subscription.planName || 'Supreme Fantasy League')} subscription is approaching its expiry point.</p><p style="margin:0;">Renew before it expires to keep your eligible competition access. Expired subscriptions are not used for future automatic league entries.</p>`,
+            buttonLabel: 'Renew my subscription',
+            buttonUrl: `${appUrl}/app/subscription`,
+            details: [
+              { label: 'Plan', value: subscription.planName || 'Subscription' },
+              { label: 'Expires', value: validUntil.toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'UTC' }) + ' UTC' },
+              { label: 'Time remaining', value: `${daysLeft} day${daysLeft === 1 ? '' : 's'}` },
+            ],
+            metadata: { subscriptionId: String(subscription._id), validUntil: validUntil.toISOString(), daysLeft },
+          });
+          if (result?.skipped || result?.error) skipped += 1;
+          else sent += 1;
+        }
+        return { checked: subscriptions.length, sent, skipped };
+      }
+
+      async function sendScheduledUserEmails(now = new Date()) {
+        const result = {
+          accountSetup: { checked: 0, sent: 0, skipped: 0 },
+          gameweek: { checked: 0, sent: 0, skipped: 0 },
+          subscriptionLapse: { checked: 0, sent: 0, skipped: 0 },
+        };
+        result.accountSetup = await sendAccountSetupReminders(now);
+        result.gameweek = await sendGameweekDeadlineReminders(now);
+        result.subscriptionLapse = await sendSubscriptionLapseReminders(now);
+        return result;
+      }
+
       async function uniqueReferralCode() {
         for (let attempt = 0; attempt < 12; attempt += 1) {
           const code = createReferralCode();
@@ -5383,6 +6019,7 @@ const localGrowth = (() => {
         runMaintenance,
         startTimers,
         sendEmail,
+        sendScheduledUserEmails,
       };
     }
     
@@ -5394,6 +6031,7 @@ const localGrowth = (() => {
     mongoose,
     models: {
       User,
+      UserProfile,
       Wallet,
       Transaction,
       Subscription,
@@ -5449,32 +6087,117 @@ if (IS_PRODUCTION && !IS_VERCEL) {
   });
 }
 
+function utcDayStart(value = new Date()) {
+  const date = new Date(value);
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+}
+
+async function claimDailyMaintenanceRun(now = new Date()) {
+  const scheduledForUtc = utcDayStart(now);
+  const runKey = `daily-maintenance:${scheduledForUtc.toISOString().slice(0, 10)}`;
+  try {
+    return await MaintenanceRun.create({
+      _id: runKey,
+      runKey,
+      schedule: 'daily',
+      scheduledForUtc,
+      status: 'running',
+      startedAt: now,
+    });
+  } catch (error) {
+    if (error?.code === 11000) return null;
+    throw error;
+  }
+}
+
+async function runDailyMaintenanceTasks() {
+  const monthlySubscriptions = await reconcileMonthlySubscriptionWindows();
+  await expireSubscriptions();
+  await reconcilePendingPaynowPayments();
+  const walletPurchases = await reconcileProcessingWalletPurchases();
+  const backfilledManagerIds = await backfillLeagueEntryFantasyManagerIds();
+  const backfilledLeagueExpiries = await backfillLeagueExpiryDates();
+  const expiredLeagues = await updateExpiredLeagueStatuses();
+  const leagueSyncs = await syncActiveLeagueScores();
+  const staleTeamReminders = await emailService.sendStaleTeamReminders();
+  const engagementEmails = await localGrowth.sendScheduledUserEmails();
+  const growth = await localGrowth.runMaintenance();
+  return {
+    tasks: [
+      'reconcile-monthly-subscription-windows',
+      'expire-subscriptions',
+      'reconcile-paynow',
+      'reconcile-wallet-purchases',
+      'backfill-league-manager-ids',
+      'backfill-league-expiries',
+      'update-expired-leagues',
+      'sync-league-scores',
+      'send-stale-team-reminders',
+      'send-account-gameweek-and-subscription-reminders',
+      'growth-maintenance',
+    ],
+    monthlySubscriptions,
+    walletPurchases,
+    backfilledManagerIds,
+    backfilledLeagueExpiries,
+    expiredLeagues,
+    leaguesScored: leagueSyncs.length,
+    staleTeamReminders,
+    engagementEmails,
+    growth,
+  };
+}
+
 app.get('/api/internal/cron/maintenance', async (req, res, next) => {
+  let run = null;
   try {
     if (!process.env.CRON_SECRET || req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
       return failure(res, 401, 'Unauthorized cron request.');
     }
-    const monthlySubscriptions = await reconcileMonthlySubscriptionWindows();
-    await expireSubscriptions();
-    await reconcilePendingPaynowPayments();
-    const walletPurchases = await reconcileProcessingWalletPurchases();
-    const backfilledManagerIds = await backfillLeagueEntryFantasyManagerIds();
-    const backfilledLeagueExpiries = await backfillLeagueExpiryDates();
-    const expiredLeagues = await updateExpiredLeagueStatuses();
-    const leagueSyncs = await syncActiveLeagueScores();
-    const growth = await localGrowth.runMaintenance();
+
+    run = await claimDailyMaintenanceRun();
+    if (!run) {
+      return success(res, {
+        skipped: true,
+        reason: 'Daily maintenance has already been claimed for the current UTC date.',
+        ranAt: new Date().toISOString(),
+      });
+    }
+
+    const result = await runDailyMaintenanceTasks();
+    const completedAt = new Date();
+    await MaintenanceRun.updateOne(
+      { _id: run._id, status: 'running' },
+      {
+        $set: {
+          status: 'completed',
+          completedAt,
+          tasks: result.tasks,
+          summary: result,
+          error: '',
+        },
+      }
+    );
+
     return success(res, {
-      ranAt: new Date().toISOString(),
-      tasks: ['reconcile-monthly-subscription-windows', 'expire-subscriptions', 'reconcile-paynow', 'reconcile-wallet-purchases', 'backfill-league-manager-ids', 'sync-league-scores'],
-      monthlySubscriptions,
-      walletPurchases,
-      backfilledManagerIds,
-      backfilledLeagueExpiries,
-      expiredLeagues,
-      leaguesScored: leagueSyncs.length,
-      growth,
+      skipped: false,
+      runKey: run.runKey,
+      ranAt: completedAt.toISOString(),
+      ...result,
     });
   } catch (error) {
+    if (run?._id) {
+      await MaintenanceRun.updateOne(
+        { _id: run._id },
+        {
+          $set: {
+            status: 'failed',
+            failedAt: new Date(),
+            error: String(error?.message || error).slice(0, 2000),
+          },
+        }
+      ).catch((updateError) => console.error('Unable to record daily maintenance failure:', updateError.message));
+    }
     return next(error);
   }
 });
