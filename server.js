@@ -42,6 +42,10 @@ const FPL_REQUEST_TIMEOUT_MS = Math.max(3000, Math.min(30000, Number(process.env
 const FPL_LEAGUE_SCORE_CACHE_MINUTES = Math.max(1, Math.min(60, Number(process.env.FPL_LEAGUE_SCORE_CACHE_MINUTES || 10)));
 const FPL_LEAGUE_SYNC_INTERVAL_MS = Math.max(60000, Number(process.env.FPL_LEAGUE_SYNC_INTERVAL_MS || 900000));
 const FPL_LEAGUE_SYNC_LIMIT = Math.max(1, Math.min(50, Number(process.env.FPL_LEAGUE_SYNC_LIMIT || 10)));
+// Bounds how many members' full squads (picks, captain, bench, etc.) get refreshed
+// per daily maintenance run. This is separate from FPL_LEAGUE_SYNC_LIMIT, which only
+// refreshes aggregate league scores and is much cheaper per member.
+const FPL_TEAM_SNAPSHOT_SYNC_LIMIT = Math.max(1, Math.min(500, Number(process.env.FPL_TEAM_SNAPSHOT_SYNC_LIMIT || 150)));
 const LEAGUE_ARCHIVE_GRACE_DAYS = Math.max(1, Math.min(30, Number(process.env.LEAGUE_ARCHIVE_GRACE_DAYS || 7)));
 const SEED_DEMO_DATA = String(process.env.SEED_DEMO_DATA || (IS_PRODUCTION ? 'false' : 'true')).trim().toLowerCase() === 'true';
 const CLOUDINARY_CLOUD_NAME = String(process.env.CLOUDINARY_CLOUD_NAME || '').trim();
@@ -2570,7 +2574,7 @@ app.get('/api/users/:userId/public-profile', requireAuth, async (req, res, next)
         .lean(),
       TeamSnapshot.findOne({ userId, syncStatus: 'success' })
         .sort({ fetchedAt: -1, createdAt: -1 })
-        .select('gameweek teamName managerName gameweekPoints totalPoints overallRank gameweekRank fetchedAt lastSuccessfulSyncAt')
+        .select('gameweek teamName managerName gameweekPoints totalPoints overallRank gameweekRank teamValue bank captain viceCaptain activeChip lineup fetchedAt lastSuccessfulSyncAt')
         .lean(),
       Transaction.aggregate([
         {
@@ -2616,6 +2620,12 @@ app.get('/api/users/:userId/public-profile', requireAuth, async (req, res, next)
           totalPoints: snapshot?.totalPoints ?? null,
           overallRank: snapshot?.overallRank ?? null,
           gameweekRank: snapshot?.gameweekRank ?? null,
+          teamValue: snapshot?.teamValue ?? null,
+          bank: snapshot?.bank ?? null,
+          captain: snapshot?.captain || '',
+          viceCaptain: snapshot?.viceCaptain || '',
+          activeChip: snapshot?.activeChip || 'None',
+          lineup: snapshot?.lineup || [],
           lastSyncedAt: snapshot?.lastSuccessfulSyncAt || snapshot?.fetchedAt || null,
         },
       },
@@ -2800,6 +2810,57 @@ async function syncActiveLeagueScores(limit = FPL_LEAGUE_SYNC_LIMIT) {
     }
   }
   return results;
+}
+
+// Refreshes each member's full squad (starting lineup, bench, captain, points per
+// player) once a day so that teammates viewing each other's teams always see
+// current data, even for members who never manually hit "Sync Team" themselves.
+// Only members of currently active leagues are refreshed, prioritising whoever has
+// gone longest without a snapshot, and the batch size is capped per run so a large
+// member base doesn't overload the FPL API in a single invocation.
+async function refreshMemberTeamSnapshots(limit = FPL_TEAM_SNAPSHOT_SYNC_LIMIT) {
+  const activeLeagueIds = await League.find({
+    status: { $in: ['open', 'full', 'upcoming', 'live', 'awaiting-review'] },
+  }).distinct('_id');
+
+  const candidates = await LeagueEntry.aggregate([
+    { $match: { leagueId: { $in: activeLeagueIds }, paymentStatus: 'paid' } },
+    { $group: { _id: '$userId' } },
+    { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } },
+    { $unwind: '$user' },
+    { $match: { 'user.fplManagerId': { $nin: [null, ''] } } },
+    {
+      $lookup: {
+        from: 'teamsnapshots',
+        let: { uid: '$_id' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$userId', '$$uid'] } } },
+          { $sort: { fetchedAt: -1 } },
+          { $limit: 1 },
+          { $project: { fetchedAt: 1 } },
+        ],
+        as: 'latestSnapshot',
+      },
+    },
+    { $addFields: { latestFetchedAt: { $ifNull: [{ $arrayElemAt: ['$latestSnapshot.fetchedAt', 0] }, new Date(0)] } } },
+    { $sort: { latestFetchedAt: 1 } },
+    { $limit: limit },
+    { $project: { userId: '$_id', fplManagerId: '$user.fplManagerId' } },
+  ]);
+
+  let refreshed = 0;
+  let failed = 0;
+  for (const candidate of candidates) {
+    try {
+      const { snapshot } = await loadFantasyTeam(candidate.fplManagerId);
+      await TeamSnapshot.create({ userId: candidate.userId, ...snapshot });
+      refreshed += 1;
+    } catch (error) {
+      failed += 1;
+      console.error('Member team snapshot refresh failed', candidate.userId, error.message);
+    }
+  }
+  return { checked: candidates.length, refreshed, failed };
 }
 
 async function buildTeamPayload(user) {
@@ -6302,6 +6363,7 @@ async function runDailyMaintenanceTasks() {
   const backfilledLeagueExpiries = await backfillLeagueExpiryDates();
   const expiredLeagues = await updateExpiredLeagueStatuses();
   const leagueSyncs = await syncActiveLeagueScores();
+  const teamSnapshots = await refreshMemberTeamSnapshots();
   const staleTeamReminders = await emailService.sendStaleTeamReminders();
   const engagementEmails = await localGrowth.sendScheduledUserEmails();
   const growth = await localGrowth.runMaintenance();
@@ -6315,6 +6377,7 @@ async function runDailyMaintenanceTasks() {
       'backfill-league-expiries',
       'update-expired-leagues',
       'sync-league-scores',
+      'refresh-member-team-snapshots',
       'send-stale-team-reminders',
       'send-account-gameweek-and-subscription-reminders',
       'growth-maintenance',
@@ -6325,6 +6388,7 @@ async function runDailyMaintenanceTasks() {
     backfilledLeagueExpiries,
     expiredLeagues,
     leaguesScored: leagueSyncs.length,
+    teamSnapshots,
     staleTeamReminders,
     engagementEmails,
     growth,
