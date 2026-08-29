@@ -431,6 +431,32 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
     });
   }
 
+  async function notifyPerformanceBonus(transaction) {
+    if (!transaction) return null;
+    const user = await User.findById(transaction.userId).lean();
+    if (!user) return null;
+    const reason = String(transaction.metadata?.reason || transaction.description || 'Performance bonus').trim();
+    return sendBrandedEmail({
+      user,
+      eventType: 'wallet.performance-bonus',
+      dedupeKey: `performance-bonus:${transaction.reference}`,
+      subject: `Performance bonus awarded — ${formatUsd(transaction.amountCents)}`,
+      eyebrow: 'Performance reward',
+      title: 'You earned a Supreme performance bonus',
+      intro: `${formatUsd(transaction.amountCents)} has been credited to your Supreme wallet as a performance bonus. The credited amount is available for withdrawal subject to the normal withdrawal rules.`,
+      content: detailRows([
+        { label: 'Bonus', value: formatUsd(transaction.amountCents) },
+        { label: 'Reason', value: reason },
+        { label: 'Reference', value: transaction.reference },
+        { label: 'Awarded', value: formatDateTime(transaction.updatedAt || transaction.createdAt || new Date()) },
+      ]),
+      actionLabel: 'View wallet / withdraw',
+      actionUrl: appLink('/app/wallet'),
+      footerNote: 'This reward was issued by Supreme Fantasy League. You can submit a withdrawal request from your wallet when your available balance meets the withdrawal requirements.',
+      metadata: { transactionId: transaction._id, reference: transaction.reference, purpose: 'performance-bonus' },
+    });
+  }
+
   async function notifyLeagueCreated(user, league) {
     return sendBrandedEmail({
       user,
@@ -645,6 +671,7 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
     notifyOwnerAdminSignup: safeNotification('notifyOwnerAdminSignup', notifyOwnerAdminSignup),
     notifyPaymentUpdate: safeNotification('notifyPaymentUpdate', notifyPaymentUpdate),
     notifyAdminWalletAdjustment: safeNotification('notifyAdminWalletAdjustment', notifyAdminWalletAdjustment),
+    notifyPerformanceBonus: safeNotification('notifyPerformanceBonus', notifyPerformanceBonus),
     notifyLeagueCreated: safeNotification('notifyLeagueCreated', notifyLeagueCreated),
     notifyLeagueMembership: safeNotification('notifyLeagueMembership', notifyLeagueMembership),
     notifyLeagueOutcomes: safeNotification('notifyLeagueOutcomes', notifyLeagueOutcomes),

@@ -59,12 +59,20 @@ async function main() {
   if (!events.size) throw new Error('FPL bootstrap-static returned no gameweek events. Nothing was changed.');
 
   const leagues = await League.find({ status: { $nin: ['settled', 'cancelled'] } }).sort({ createdAt: 1 });
-  const endGameweeks = [...new Set(leagues.map((league) => Number(league.endGameweek)).filter((gw) => events.has(gw)))];
-  const fixtureKickoffs = new Map();
+  const usedGameweeks = [...new Set(leagues.flatMap((league) => {
+    const start = Number(league.startGameweek);
+    const end = Number(league.endGameweek);
+    return Number.isInteger(start) && Number.isInteger(end) ? Array.from({ length: Math.max(0, end - start + 1) }, (_, index) => start + index) : [];
+  }).filter((gw) => events.has(gw)))];
+  const fixtureState = new Map();
 
-  for (const gw of endGameweeks) {
+  for (const gw of usedGameweeks) {
     const fixtures = await fetchFplJson(`/fixtures/?event=${gw}`);
-    fixtureKickoffs.set(gw, lastFixtureKickoff(fixtures));
+    fixtureState.set(gw, {
+      lastKickoffAt: lastFixtureKickoff(fixtures),
+      fixtureCount: Array.isArray(fixtures) ? fixtures.length : 0,
+      allFinished: Array.isArray(fixtures) && fixtures.length > 0 && fixtures.every((fixture) => fixture.finished === true),
+    });
   }
 
   const now = new Date();
@@ -92,13 +100,20 @@ async function main() {
     }
 
     const startDeadlineAt = validDate(startEvent.deadline_time);
-    const lastKickoffAt = fixtureKickoffs.get(Number(league.endGameweek)) || null;
+    const lastKickoffAt = fixtureState.get(Number(league.endGameweek))?.lastKickoffAt || null;
+    const rangeEvents = [];
+    for (let gw = Number(league.startGameweek); gw <= Number(league.endGameweek); gw += 1) {
+      if (events.has(gw)) rangeEvents.push(events.get(gw));
+    }
+    const footballFinished = rangeEvents.length === Number(league.endGameweek) - Number(league.startGameweek) + 1
+      && rangeEvents.every((event) => event.finished === true && fixtureState.get(Number(event.id))?.allFinished === true);
+    const scoringFinalized = footballFinished && rangeEvents.every((event) => event.data_checked === true);
     const paidCount = await LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: 'paid' });
 
     league.fplJoinDeadlineAt = startDeadlineAt;
     league.fplLastFixtureKickoffAt = lastKickoffAt;
 
-    if (endEvent.finished === true) {
+    if (footballFinished) {
       const observedFinishedAt = league.fplFinishedAt || now;
       league.fplFinishedAt = observedFinishedAt;
       league.expiresAt = observedFinishedAt;
@@ -117,20 +132,20 @@ async function main() {
       }
     }
 
-    if (endEvent.data_checked === true) {
+    if (scoringFinalized) {
       league.fplDataCheckedAt = league.fplDataCheckedAt || now;
     } else {
       league.fplDataCheckedAt = null;
-      if (endEvent.finished === true) summary.awaitingDataCheck += 1;
+      if (footballFinished) summary.awaitingDataCheck += 1;
     }
 
     const meta = await SupremeLeagueMeta.findOne({ leagueId: league._id });
     if (meta) {
       meta.joinDeadlineAt = startDeadlineAt || meta.joinDeadlineAt;
       meta.lastFixtureKickoffAt = lastKickoffAt;
-      if (endEvent.finished === true) meta.finishedAt = meta.finishedAt || now;
+      if (footballFinished) meta.finishedAt = meta.finishedAt || now;
       else meta.finishedAt = null;
-      if (endEvent.data_checked === true) meta.dataCheckedAt = meta.dataCheckedAt || now;
+      if (scoringFinalized) meta.dataCheckedAt = meta.dataCheckedAt || now;
       else meta.dataCheckedAt = null;
 
       if (meta.cadence === 'weekly') {
@@ -140,6 +155,8 @@ async function main() {
         league.guaranteedPrize = true;
         meta.entryFeeCents = WEEKLY_ENTRY_FEE_CENTS;
         meta.prizeCents = WEEKLY_PRIZE_CENTS;
+        meta.entryMode = 'weekly-flex';
+        meta.scoringMode = 'manager-points';
         summary.weeklyPriceCorrections += 1;
       }
 
