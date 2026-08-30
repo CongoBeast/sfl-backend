@@ -3357,7 +3357,7 @@ async function buildGameweekAvailabilityContexts(gameweeks = []) {
     try {
       const fixtures = await fetchFplJson(`/fixtures/?event=${gameweek}`, { cacheMinutes: 1 });
       const teamRemaining = new Map();
-      for (const [teamId, team] of teamMap.entries()) {
+      for (const [teamId] of teamMap.entries()) {
         const relevantFixtures = (Array.isArray(fixtures) ? fixtures : []).filter((fixture) => Number(fixture.team_h) === teamId || Number(fixture.team_a) === teamId);
         const hasRemainingFixture = relevantFixtures.length ? relevantFixtures.some((fixture) => !fixture.finished) : false;
         teamRemaining.set(teamId, hasRemainingFixture);
@@ -3385,26 +3385,31 @@ function getLineupTeamId(player, context) {
 }
 
 function buildLeaderboardRowLiveMetrics(snapshot, context) {
-  const lineup = Array.isArray(snapshot?.lineup) ? snapshot.lineup : [];
-  const totalPlayers = lineup.length || 15;
-  if (!context || !lineup.length) {
+  const activeChip = snapshot?.activeChip || 'None';
+  const benchBoost = String(activeChip || '').trim().toLowerCase() === 'bboost';
+  const allLineup = Array.isArray(snapshot?.lineup) ? snapshot.lineup : [];
+  const countedPlayers = allLineup.filter((player) => benchBoost || Boolean(player?.starter));
+  const totalPlayers = countedPlayers.length || (benchBoost ? 15 : 11);
+
+  if (!context || !countedPlayers.length) {
     return {
       playersRemaining: null,
       playersPlayed: null,
       totalPlayers,
       playersRemainingPercent: null,
       playersRemainingLabel: '—',
-      activeChip: snapshot?.activeChip || 'None',
-      activeChipLabel: formatActiveChipLabel(snapshot?.activeChip),
-      chipUsed: Boolean(snapshot?.activeChip && String(snapshot.activeChip).toLowerCase() !== 'none'),
+      activeChip,
+      activeChipLabel: formatActiveChipLabel(activeChip),
+      chipUsed: Boolean(activeChip && String(activeChip).toLowerCase() !== 'none'),
       transfers: Number(snapshot?.transfers || 0),
       transferCost: Number(snapshot?.transferCost || 0),
       liveGameweek: Number(snapshot?.gameweek || 0) || null,
+      usesBenchBoost: benchBoost,
     };
   }
 
   let playersRemaining = 0;
-  for (const player of lineup) {
+  for (const player of countedPlayers) {
     const teamId = getLineupTeamId(player, context);
     if (teamId && context.teamRemaining.get(teamId)) playersRemaining += 1;
   }
@@ -3416,16 +3421,115 @@ function buildLeaderboardRowLiveMetrics(snapshot, context) {
     totalPlayers,
     playersRemainingPercent,
     playersRemainingLabel: totalPlayers ? `${playersRemaining}/${totalPlayers} (${playersRemainingPercent}%)` : '—',
-    activeChip: snapshot?.activeChip || 'None',
-    activeChipLabel: formatActiveChipLabel(snapshot?.activeChip),
-    chipUsed: Boolean(snapshot?.activeChip && String(snapshot.activeChip).toLowerCase() !== 'none'),
+    activeChip,
+    activeChipLabel: formatActiveChipLabel(activeChip),
+    chipUsed: Boolean(activeChip && String(activeChip).toLowerCase() !== 'none'),
     transfers: Number(snapshot?.transfers || 0),
     transferCost: Number(snapshot?.transferCost || 0),
     liveGameweek: Number(snapshot?.gameweek || 0) || null,
+    usesBenchBoost: benchBoost,
   };
 }
 
-async function getLeagueLeaderboard(leagueId, currentUserId) {
+async function asyncMapLimit(items, limit, mapper) {
+  const list = Array.isArray(items) ? items : [];
+  const capped = Math.max(1, Number(limit) || 1);
+  const results = new Array(list.length);
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < list.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await mapper(list[index], index);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(capped, list.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+async function resolveLeaderboardParticipantSnapshot(userDoc, fallbackSnapshot = null) {
+  const managerId = normalizeManagerId(userDoc?.fplManagerId || '');
+  if (!managerId) return fallbackSnapshot;
+  try {
+    const providerData = await loadFantasyTeam(managerId);
+    return providerData?.snapshot || fallbackSnapshot;
+  } catch (error) {
+    return fallbackSnapshot;
+  }
+}
+
+function textToSvg(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function leaderboardTransferLabel(row) {
+  const transfers = Number(row?.transfers || 0);
+  const cost = Number(row?.transferCost || 0);
+  if (!transfers) return '0';
+  return cost > 0 ? `${transfers} (-${cost})` : `${transfers}`;
+}
+
+function buildLeagueLeaderboardShareSvg(league, rows = []) {
+  const topRows = (Array.isArray(rows) ? rows : []).slice(0, 5);
+  const width = 1400;
+  const rowHeight = 94;
+  const height = 280 + (topRows.length * rowHeight);
+  const subtitle = league?.scoreThroughGameweek
+    ? `Top 5 • Scored through GW ${league.scoreThroughGameweek}`
+    : `Top 5 • ${league?.status ? formatActiveChipLabel(String(league.status).replace(/\s+/g, '-')) : 'Leaderboard'}`;
+  const rowsSvg = topRows.map((row, index) => {
+    const y = 205 + (index * rowHeight);
+    return `
+      <rect x="36" y="${y - 34}" width="1328" height="78" rx="22" fill="rgba(255,255,255,0.045)" stroke="rgba(255,255,255,0.08)" />
+      <text x="64" y="${y + 12}" font-size="36" fill="#f8fafc" font-weight="800">${textToSvg(row.rank)}</text>
+      <text x="140" y="${y - 4}" font-size="30" fill="#f8fafc" font-weight="700">${textToSvg(row.name)}</text>
+      <text x="140" y="${y + 26}" font-size="21" fill="#94a3b8">${textToSvg(row.teamName || row.managerName || '')}</text>
+      <text x="770" y="${y - 4}" font-size="28" fill="#f8fafc" font-weight="700" text-anchor="end">${textToSvg(row.score ?? 0)} pts</text>
+      <text x="1030" y="${y - 4}" font-size="22" fill="#cbd5e1" text-anchor="end">${textToSvg(row.playersRemainingLabel || '—')}</text>
+      <text x="1200" y="${y - 4}" font-size="22" fill="#cbd5e1" text-anchor="end">${textToSvg(row.activeChipLabel || 'No chip')}</text>
+      <text x="1325" y="${y - 4}" font-size="22" fill="#cbd5e1" text-anchor="end">${textToSvg(leaderboardTransferLabel(row))}</text>
+    `;
+  }).join('');
+
+  return `
+  <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+    <defs>
+      <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="#020617" />
+        <stop offset="50%" stop-color="#0f172a" />
+        <stop offset="100%" stop-color="#111827" />
+      </linearGradient>
+      <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="#38bdf8" />
+        <stop offset="100%" stop-color="#22c55e" />
+      </linearGradient>
+    </defs>
+    <rect width="100%" height="100%" fill="url(#bg)" rx="32" />
+    <rect x="36" y="32" width="220" height="10" rx="999" fill="url(#accent)" />
+    <text x="36" y="78" font-size="27" fill="#38bdf8" font-weight="800">SUPREME FANTASY LEAGUE</text>
+    <text x="36" y="128" font-size="50" fill="#f8fafc" font-weight="800">${textToSvg(league?.name || 'League leaderboard')}</text>
+    <text x="36" y="165" font-size="24" fill="#94a3b8">${textToSvg(subtitle)}</text>
+    <text x="36" y="212" font-size="18" fill="#64748b">Rank</text>
+    <text x="140" y="212" font-size="18" fill="#64748b">Player</text>
+    <text x="770" y="212" font-size="18" fill="#64748b" text-anchor="end">Points</text>
+    <text x="1030" y="212" font-size="18" fill="#64748b" text-anchor="end">Players left</text>
+    <text x="1200" y="212" font-size="18" fill="#64748b" text-anchor="end">Chip</text>
+    <text x="1325" y="212" font-size="18" fill="#64748b" text-anchor="end">Transfers</text>
+    ${rowsSvg}
+    <text x="36" y="${height - 20}" font-size="16" fill="#64748b">Players left counts the starting 11 only, unless Bench Boost is active, in which case all 15 players are counted.</text>
+  </svg>`;
+}
+
+async function getLeagueLeaderboard(leagueId, currentUserId, options = {}) {
+  const { liveMetrics = true } = options;
   const entries = await LeagueEntry.find({ leagueId, paymentStatus: 'paid' })
     .sort({ currentScore: -1, latestOverallRank: 1, joinedAt: 1 })
     .populate('userId', 'fullName fantasyTeamName fplManagerId')
@@ -3444,12 +3548,31 @@ async function getLeagueLeaderboard(leagueId, currentUserId) {
     const key = String(snapshot.userId);
     if (!snapshotMap.has(key)) snapshotMap.set(key, snapshot);
   }
-  const availabilityContexts = await buildGameweekAvailabilityContexts([...snapshotMap.values()].map((snapshot) => snapshot.gameweek));
+
+  const resolvedSnapshots = new Map();
+  if (liveMetrics) {
+    const hydrated = await asyncMapLimit(entries, 4, async (entry) => {
+      const userId = String(entry.userId?._id || '');
+      const fallbackSnapshot = snapshotMap.get(userId) || null;
+      const resolved = await resolveLeaderboardParticipantSnapshot(entry.userId, fallbackSnapshot);
+      return { userId, snapshot: resolved || fallbackSnapshot };
+    });
+    hydrated.forEach((item) => {
+      if (item?.userId) resolvedSnapshots.set(item.userId, item.snapshot || null);
+    });
+  }
+
+  const availabilityContexts = await buildGameweekAvailabilityContexts(
+    entries.map((entry) => {
+      const userId = String(entry.userId?._id || '');
+      return (resolvedSnapshots.get(userId) || snapshotMap.get(userId) || {}).gameweek;
+    })
+  );
 
   return entries.map((entry, index) => {
     const userId = String(entry.userId?._id || '');
-    const snapshot = snapshotMap.get(userId);
-    const liveMetrics = buildLeaderboardRowLiveMetrics(snapshot, availabilityContexts.get(Number(snapshot?.gameweek || 0)));
+    const snapshot = resolvedSnapshots.get(userId) || snapshotMap.get(userId) || null;
+    const liveMetricsRow = buildLeaderboardRowLiveMetrics(snapshot, availabilityContexts.get(Number(snapshot?.gameweek || 0)));
     return {
       rank: index + 1,
       userId: entry.userId?._id,
@@ -3461,11 +3584,29 @@ async function getLeagueLeaderboard(leagueId, currentUserId) {
       eligibilityStatus: entry.eligibilityStatus,
       prizeCents: entry.prizeCents,
       isCurrentUser: userId === String(currentUserId),
-      ...liveMetrics,
+      ...liveMetricsRow,
       lastTeamSyncAt: snapshot?.fetchedAt || null,
     };
   });
 }
+
+app.get('/api/leagues/:leagueId/leaderboard-card', requireAuth, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.leagueId)) return failure(res, 404, 'League not found.');
+    const league = await League.findById(req.params.leagueId);
+    if (!league) return failure(res, 404, 'League not found.');
+    const entry = await LeagueEntry.findOne({ leagueId: league._id, userId: req.user._id });
+    const isCreator = String(league.createdBy || '') === String(req.user._id);
+    if (league.inviteOnly && !isCreator && !entry) return failure(res, 403, 'Use the league code page to access this private league.');
+
+    const leaderboard = await getLeagueLeaderboard(league._id, req.user._id, { liveMetrics: true });
+    const svg = buildLeagueLeaderboardShareSvg(league, leaderboard);
+    const safeName = String(league.name || 'league-leaderboard').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'league-leaderboard';
+    res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}-top-5.svg"`);
+    return res.status(200).send(svg);
+  } catch (error) { next(error); }
+});
 
 app.post('/api/leagues/:leagueId/sync-scores', requireAuth, writeLimiter, async (req, res, next) => {
   try {
