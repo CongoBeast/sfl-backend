@@ -39,13 +39,15 @@ const MOCK_FANTASY = FPL_DATA_MODE === 'mock';
 const FPL_BASE_URL = String(process.env.FPL_BASE_URL || 'https://fantasy.premierleague.com/api').replace(/\/$/, '');
 const FPL_CACHE_MINUTES = Math.max(1, Math.min(60, Number(process.env.FPL_CACHE_MINUTES || 10)));
 const FPL_REQUEST_TIMEOUT_MS = Math.max(3000, Math.min(30000, Number(process.env.FPL_REQUEST_TIMEOUT_MS || 12000)));
-const FPL_LEAGUE_SCORE_CACHE_MINUTES = Math.max(1, Math.min(60, Number(process.env.FPL_LEAGUE_SCORE_CACHE_MINUTES || 10)));
+const FPL_LEAGUE_SCORE_CACHE_MINUTES = Math.max(1, Math.min(60, Number(process.env.FPL_LEAGUE_SCORE_CACHE_MINUTES || 2)));
+const FPL_PAGE_REFRESH_CACHE_MINUTES = Math.max(1, Math.min(30, Number(process.env.FPL_PAGE_REFRESH_CACHE_MINUTES || 10)));
+const SUPREME_PLANNING_HORIZON_DAYS = Math.max(30, Math.min(120, Number(process.env.SUPREME_PLANNING_HORIZON_DAYS || 60)));
 const FPL_LEAGUE_SYNC_INTERVAL_MS = Math.max(60000, Number(process.env.FPL_LEAGUE_SYNC_INTERVAL_MS || 900000));
 const FPL_LEAGUE_SYNC_LIMIT = Math.max(1, Math.min(50, Number(process.env.FPL_LEAGUE_SYNC_LIMIT || 10)));
 // Bounds how many members' full squads (picks, captain, bench, etc.) get refreshed
 // per daily maintenance run. This is separate from FPL_LEAGUE_SYNC_LIMIT, which only
 // refreshes aggregate league scores and is much cheaper per member.
-const FPL_TEAM_SNAPSHOT_SYNC_LIMIT = Math.max(1, Math.min(500, Number(process.env.FPL_TEAM_SNAPSHOT_SYNC_LIMIT || 150)));
+const FPL_TEAM_SNAPSHOT_SYNC_LIMIT = Math.max(1, Math.min(5000, Number(process.env.FPL_TEAM_SNAPSHOT_SYNC_LIMIT || 1000)));
 const SEED_DEMO_DATA = String(process.env.SEED_DEMO_DATA || (IS_PRODUCTION ? 'false' : 'true')).trim().toLowerCase() === 'true';
 const CLOUDINARY_CLOUD_NAME = String(process.env.CLOUDINARY_CLOUD_NAME || '').trim();
 const CLOUDINARY_API_KEY = String(process.env.CLOUDINARY_API_KEY || '').trim();
@@ -509,6 +511,7 @@ const leagueEntrySchema = new Schema({
   scoreSyncStatus: { type: String, default: 'idle', enum: ['idle', 'success', 'failed'] },
   scoreSyncError: { type: String, default: '' },
   latestOverallRank: { type: Number, default: 0 },
+  scoreDetails: { type: Schema.Types.Mixed, default: {} },
 }, { timestamps: true });
 leagueEntrySchema.index({ leagueId: 1, userId: 1 }, { unique: true });
 
@@ -863,7 +866,7 @@ async function fetchFplJson(resource, options = {}) {
   const cacheMinutes = Number.isFinite(options.cacheMinutes) ? options.cacheMinutes : FPL_CACHE_MINUTES;
   const cacheKey = resource;
   const cached = fplCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return cached.data;
+  if (!options.force && cached && cached.expiresAt > Date.now()) return cached.data;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FPL_REQUEST_TIMEOUT_MS);
@@ -970,8 +973,8 @@ const mockFantasyProvider = {
 };
 
 const publicFantasyProvider = {
-  async getBootstrap() {
-    return fetchFplJson('/bootstrap-static/');
+  async getBootstrap(options = {}) {
+    return fetchFplJson('/bootstrap-static/', options);
   },
 
   async getGameState() {
@@ -1074,8 +1077,6 @@ const publicFantasyProvider = {
         elementId: Number(pick.element),
         name: player.web_name || `Player ${pick.element}`,
         club: team.short_name || team.name || '',
-        teamId: Number(team.id || 0),
-        teamName: team.name || team.short_name || '',
         position: position.singular_name_short || position.singular_name || '',
         lineupPosition: Number(pick.position || 0),
         multiplier,
@@ -1165,6 +1166,29 @@ async function loadFantasyTeam(managerId) {
       fetchedAt,
     },
   };
+}
+
+async function persistFantasyTeamSnapshot(user, { force = true } = {}) {
+  if (!user?.fplManagerId) return { snapshot: null, manager: null, history: [], linked: false };
+  const existing = await TeamSnapshot.findOne({ userId: user._id, providerMode: FPL_DATA_MODE })
+    .sort({ fetchedAt: -1, updatedAt: -1 });
+  const freshnessMs = Math.max(0, FPL_PAGE_REFRESH_CACHE_MINUTES) * 60 * 1000;
+  if (!force && existing?.fetchedAt && Date.now() - new Date(existing.fetchedAt).getTime() < freshnessMs) {
+    return { snapshot: existing.toObject(), manager: null, history: [], linked: true, cached: true };
+  }
+
+  const providerData = await loadFantasyTeam(user.fplManagerId);
+  const normalizedSnapshot = providerData.snapshot;
+  const snapshot = await TeamSnapshot.findOneAndUpdate(
+    { userId: user._id, gameweek: normalizedSnapshot.gameweek, providerMode: normalizedSnapshot.providerMode },
+    { $set: { ...normalizedSnapshot, userId: user._id } },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+  if (providerData.manager?.teamName && providerData.manager.teamName !== user.fantasyTeamName) {
+    await User.updateOne({ _id: user._id }, { $set: { fantasyTeamName: providerData.manager.teamName } });
+    user.fantasyTeamName = providerData.manager.teamName;
+  }
+  return { ...providerData, snapshot, linked: true, cached: false };
 }
 
 // -----------------------------------------------------------------------------
@@ -2131,16 +2155,29 @@ async function getEarningsLeaderboard(currentUserId, limit = 10) {
 }
 
 async function leagueView(league, userId = null) {
-  const participantCount = await LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: 'paid' });
-  const reservedCount = await LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: { $in: ['paid', 'pending'] } });
+  // Keep list/detail reads DB-only and parallel. Live FPL work is deliberately
+  // handled by the page's automatic refresh request after cached content renders.
+  const [participantCount, reservedCount, entry, accessPolicy] = await Promise.all([
+    LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: 'paid' }),
+    LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: { $in: ['paid', 'pending'] } }),
+    userId ? LeagueEntry.findOne({ leagueId: league._id, userId }).lean() : Promise.resolve(null),
+    localGrowth.getLeagueAccessPolicy(league._id),
+  ]);
   const grossPoolCents = participantCount * league.entryFeeCents;
   const platformFeeCents = league.customLeague ? Math.round(grossPoolCents * league.platformFeeBasisPoints / 10000) : 0;
   const projectedPrizeCents = league.customLeague ? grossPoolCents - platformFeeCents : league.projectedPrizeCents;
-  let entry = null;
-  if (userId) entry = await LeagueEntry.findOne({ leagueId: league._id, userId }).lean();
   const createdByCurrentUser = Boolean(userId && String(league.createdBy || '') === String(userId));
   const joined = entry?.paymentStatus === 'paid';
-  const accessPolicy = await localGrowth.getLeagueAccessPolicy(league._id);
+  const now = new Date();
+  const joinDeadlineAt = accessPolicy?.joinDeadlineAt || league.fplJoinDeadlineAt || null;
+  const deadline = joinDeadlineAt ? new Date(joinDeadlineAt) : null;
+  const hasCapacity = reservedCount < Number(league.maximumParticipants || 0);
+  const joinOpen = Boolean(
+    !leagueIsPast(league, now)
+    && ['open', 'upcoming'].includes(league.status)
+    && hasCapacity
+    && (!deadline || Number.isNaN(deadline.getTime()) || deadline > now)
+  );
   return {
     id: league._id,
     name: league.name,
@@ -2151,7 +2188,8 @@ async function leagueView(league, userId = null) {
     customLeague: league.customLeague,
     inviteOnly: league.inviteOnly,
     visibility: accessPolicy?.visibility || (league.inviteOnly ? 'private' : 'public'),
-    joinDeadlineAt: accessPolicy?.joinDeadlineAt || league.fplJoinDeadlineAt || null,
+    joinDeadlineAt,
+    joinOpen,
     allowLateJoin: accessPolicy?.allowLateJoin !== false,
     inviteCode: createdByCurrentUser ? league.inviteCode : '',
     createdByCurrentUser,
@@ -2564,7 +2602,9 @@ app.post('/api/profile/link-fantasy-team', requireAuth, writeLimiter, async (req
     if (!/^\d+$/.test(managerId)) return failure(res, 400, 'Fantasy manager ID must contain numbers only.');
     const manager = await fantasyProvider.getManager(managerId);
     await linkFantasyManagerToUser(req.user, managerId, manager.teamName);
-    return success(res, { manager });
+    const snapshot = await persistFantasyTeamSnapshot(req.user, { force: true }).catch((error) => ({ error: error.message }));
+    const enrollment = await localGrowth.enrollUserInOpenSupremeLeagues(req.user._id).catch((error) => ({ enrolled: 0, error: error.message }));
+    return success(res, { manager, snapshot, enrollment });
   } catch (error) { next(error); }
 });
 
@@ -2578,16 +2618,12 @@ app.get('/api/users/:userId/public-profile', requireAuth, async (req, res, next)
     }
 
     const userId = new mongoose.Types.ObjectId(req.params.userId);
-    const [user, profile, snapshot, winStats] = await Promise.all([
+    const [user, profile, winStats] = await Promise.all([
       User.findById(userId)
         .select('fullName fantasyTeamName fplManagerId status createdAt')
         .lean(),
       UserProfile.findOne({ userId })
         .select('profilePicture')
-        .lean(),
-      TeamSnapshot.findOne({ userId, syncStatus: 'success' })
-        .sort({ fetchedAt: -1, createdAt: -1 })
-        .select('gameweek teamName managerName gameweekPoints totalPoints overallRank gameweekRank teamValue bank captain viceCaptain activeChip lineup fetchedAt lastSuccessfulSyncAt')
         .lean(),
       Transaction.aggregate([
         {
@@ -2611,6 +2647,21 @@ app.get('/api/users/:userId/public-profile', requireAuth, async (req, res, next)
 
     if (!user || user.status === 'closed') {
       return failure(res, 404, 'Player profile not found.');
+    }
+
+    let snapshot = await TeamSnapshot.findOne({ userId, syncStatus: 'success' })
+      .sort({ fetchedAt: -1, createdAt: -1 })
+      .select('gameweek teamName managerName gameweekPoints totalPoints overallRank gameweekRank teamValue bank captain viceCaptain activeChip lineup fetchedAt lastSuccessfulSyncAt')
+      .lean();
+    let refreshWarning = '';
+    const refreshRequested = String(req.query.refresh || '') === '1';
+    if (user.fplManagerId && refreshRequested) {
+      try {
+        const refreshed = await persistFantasyTeamSnapshot(user, { force: false });
+        snapshot = refreshed.snapshot?.toObject ? refreshed.snapshot.toObject() : refreshed.snapshot || snapshot;
+      } catch (error) {
+        refreshWarning = String(error.message || error);
+      }
     }
 
     const results = winStats[0] || {};
@@ -2640,6 +2691,7 @@ app.get('/api/users/:userId/public-profile', requireAuth, async (req, res, next)
           activeChip: snapshot?.activeChip || 'None',
           lineup: snapshot?.lineup || [],
           lastSyncedAt: snapshot?.lastSuccessfulSyncAt || snapshot?.fetchedAt || null,
+          refreshWarning,
         },
       },
     });
@@ -2697,17 +2749,31 @@ async function getFplGameweekSchedule(gameweek, { bootstrap = null, includeFixtu
   }
 
   let lastFixtureKickoffAt = null;
+  let fixtureCount = 0;
+  let fixturesFinished = null;
+  let hasProvisionalOnlyFixtures = false;
   if (includeFixtures) {
-    const fixtures = await fetchFplJson(`/fixtures/?event=${eventId}`, { cacheMinutes: FPL_CACHE_MINUTES });
+    const fixtures = await fetchFplJson(`/fixtures/?event=${eventId}`, { cacheMinutes: Math.min(FPL_CACHE_MINUTES, 2) });
+    fixtureCount = Array.isArray(fixtures) ? fixtures.length : 0;
     lastFixtureKickoffAt = latestFixtureKickoff(fixtures);
+    fixturesFinished = fixtureCount > 0 && fixtures.every((fixture) => fixture?.finished === true);
+    hasProvisionalOnlyFixtures = fixtureCount > 0 && fixtures.some(
+      (fixture) => fixture?.finished !== true && fixture?.finished_provisional === true
+    );
   }
 
   const deadlineAt = event.deadline_time ? new Date(event.deadline_time) : null;
+  const eventFinished = event.finished === true;
+  const footballFinished = includeFixtures ? Boolean(eventFinished && fixturesFinished) : eventFinished;
   return {
     gameweek: eventId,
     deadlineAt: deadlineAt && !Number.isNaN(deadlineAt.getTime()) ? deadlineAt : null,
     lastFixtureKickoffAt,
-    finished: event.finished === true,
+    eventFinished,
+    fixturesFinished,
+    fixtureCount,
+    hasProvisionalOnlyFixtures,
+    finished: footballFinished,
     dataChecked: event.data_checked === true,
     isCurrent: event.is_current === true,
     isNext: event.is_next === true,
@@ -2716,7 +2782,34 @@ async function getFplGameweekSchedule(gameweek, { bootstrap = null, includeFixtu
   };
 }
 
-async function applyFplLifecycleToLeague(league, bootstrap, now = new Date(), { includeFixtures = false } = {}) {
+async function getVerifiedFplRangeState(startGameweek, endGameweek, { bootstrap = null } = {}) {
+  if (FPL_DATA_MODE !== 'public') {
+    return { finished: false, dataChecked: false, events: [], schedules: [], reason: 'provider-not-public' };
+  }
+  const bootstrapData = bootstrap || await publicFantasyProvider.getBootstrap({ cacheMinutes: 1 });
+  const start = Number(startGameweek);
+  const end = Number(endGameweek);
+  const events = (bootstrapData.events || []).filter((event) => Number(event.id) >= start && Number(event.id) <= end);
+  if (!events.length || events.length !== end - start + 1) {
+    return { finished: false, dataChecked: false, events, schedules: [], reason: 'missing-events' };
+  }
+  const schedules = [];
+  for (const event of events) {
+    schedules.push(await getFplGameweekSchedule(event.id, { bootstrap: bootstrapData, includeFixtures: true }));
+  }
+  const finished = schedules.every((schedule) => schedule.eventFinished === true && schedule.fixturesFinished === true);
+  const dataChecked = finished && events.every((event) => event.data_checked === true);
+  return {
+    finished,
+    dataChecked,
+    events,
+    schedules,
+    reason: finished ? (dataChecked ? 'final' : 'awaiting-data-check') : 'football-not-finished',
+    lastFixtureKickoffAt: schedules.map((item) => item.lastFixtureKickoffAt).filter(Boolean).sort((a, b) => b - a)[0] || null,
+  };
+}
+
+async function applyFplLifecycleToLeague(league, bootstrap, now = new Date(), { includeFixtures = true } = {}) {
   if (!league || FPL_DATA_MODE !== 'public') return false;
   const startEvent = fplEventFromBootstrap(bootstrap, league.startGameweek);
   const endEvent = fplEventFromBootstrap(bootstrap, league.endGameweek);
@@ -2727,16 +2820,21 @@ async function applyFplLifecycleToLeague(league, bootstrap, now = new Date(), { 
     league.fplJoinDeadlineAt = startDeadlineAt;
   }
 
-  if (includeFixtures && !league.fplLastFixtureKickoffAt) {
+  let endSchedule = null;
+  if (includeFixtures) {
     try {
-      const schedule = await getFplGameweekSchedule(league.endGameweek, { bootstrap, includeFixtures: true });
-      if (schedule.lastFixtureKickoffAt) league.fplLastFixtureKickoffAt = schedule.lastFixtureKickoffAt;
+      endSchedule = await getFplGameweekSchedule(league.endGameweek, { bootstrap, includeFixtures: true });
+      if (endSchedule.lastFixtureKickoffAt) league.fplLastFixtureKickoffAt = endSchedule.lastFixtureKickoffAt;
     } catch (error) {
       console.warn(`Could not load FPL fixtures for league ${league._id}:`, error.message);
     }
   }
 
-  if (endEvent.finished === true) {
+  const footballFinished = includeFixtures
+    ? Boolean(endSchedule?.eventFinished === true && endSchedule?.fixturesFinished === true)
+    : endEvent.finished === true;
+
+  if (footballFinished) {
     const observedFinishedAt = league.fplFinishedAt || now;
     league.fplFinishedAt = observedFinishedAt;
     league.expiresAt = observedFinishedAt;
@@ -2828,7 +2926,7 @@ async function updateExpiredLeagueStatuses() {
     let updated = 0;
     const now = new Date();
     for (const league of leagues) {
-      if (await applyFplLifecycleToLeague(league, bootstrap, now)) updated += 1;
+      if (await applyFplLifecycleToLeague(league, bootstrap, now, { includeFixtures: true })) updated += 1;
     }
     return updated;
   } catch (error) {
@@ -2859,6 +2957,60 @@ async function refreshLeagueLifecycleIfStale(maxAgeMs = 5 * 60 * 1000) {
       leagueLifecycleRefreshPromise = null;
     });
   return leagueLifecycleRefreshPromise;
+}
+
+async function scoreManagerForLeague(managerId, league, scoreThroughGameweek) {
+  const id = normalizeManagerId(managerId);
+  if (league.ruleType === 'captain-vice-score' || league.competitionType === 'clash-captains') {
+    const gameweek = Number(league.startGameweek);
+    const picks = await fantasyProvider.getManagerPicks(id, gameweek);
+    const captain = (picks.lineup || []).find((player) => player.isCaptain);
+    const viceCaptain = (picks.lineup || []).find((player) => player.isViceCaptain);
+    if (!captain || !viceCaptain) throw new Error(`Captain or vice-captain data is unavailable for FPL manager ${id} in Gameweek ${gameweek}.`);
+    return {
+      score: Number(captain.points || 0) + Number(viceCaptain.points || 0),
+      latestOverallRank: Number(picks.entryHistory?.overall_rank || Number.MAX_SAFE_INTEGER),
+      details: {
+        scoringMode: 'captain-vice-raw-points',
+        gameweek,
+        captain: { elementId: captain.elementId, name: captain.name, points: Number(captain.points || 0) },
+        viceCaptain: { elementId: viceCaptain.elementId, name: viceCaptain.name, points: Number(viceCaptain.points || 0) },
+      },
+    };
+  }
+
+  const history = await fantasyProvider.getManagerHistory(id);
+  const relevant = history.filter((week) => week.gameweek >= league.startGameweek && week.gameweek <= scoreThroughGameweek);
+  let score = relevant.reduce((total, week) => total + Number(week.points || 0), 0);
+  let latest = relevant.length ? relevant[relevant.length - 1] : null;
+
+  // For a currently active gameweek, picks.entry_history is usually fresher than
+  // /history/. Replace that GW's history value with the latest public value.
+  if (scoreThroughGameweek >= league.startGameweek && scoreThroughGameweek <= league.endGameweek) {
+    try {
+      const picks = await fantasyProvider.getManagerPicks(id, scoreThroughGameweek);
+      const livePoints = Number(picks.entryHistory?.points);
+      if (Number.isFinite(livePoints)) {
+        const historyCurrent = relevant.find((week) => Number(week.gameweek) === Number(scoreThroughGameweek));
+        score = score - Number(historyCurrent?.points || 0) + livePoints;
+        latest = {
+          ...(historyCurrent || {}),
+          gameweek: scoreThroughGameweek,
+          points: livePoints,
+          rank: Number(picks.entryHistory?.overall_rank || historyCurrent?.rank || 0),
+          gameweekRank: Number(picks.entryHistory?.rank || historyCurrent?.gameweekRank || 0),
+        };
+      }
+    } catch (error) {
+      if (![404, 409].includes(Number(error.status || error.providerStatus || 0))) throw error;
+    }
+  }
+
+  return {
+    score,
+    latestOverallRank: Number(latest?.rank || Number.MAX_SAFE_INTEGER),
+    details: { scoringMode: 'fpl-gameweek-points', scoreThroughGameweek },
+  };
 }
 
 async function syncLeagueScores(leagueId, { force = false } = {}) {
@@ -2906,13 +3058,11 @@ async function syncLeagueScores(leagueId, { force = false } = {}) {
 
     try {
       if (!entry.fantasyManagerId) entry.fantasyManagerId = managerId;
-      const history = await fantasyProvider.getManagerHistory(managerId);
-      const relevant = history.filter((week) => week.gameweek >= league.startGameweek && week.gameweek <= scoreThroughGameweek);
-      const score = relevant.reduce((total, week) => total + Number(week.points || 0), 0);
-      const latest = relevant.length ? relevant[relevant.length - 1] : null;
-      entry.currentScore = score;
+      const scoreResult = await scoreManagerForLeague(managerId, league, scoreThroughGameweek);
+      entry.currentScore = scoreResult.score;
       entry.scoreThroughGameweek = scoreThroughGameweek;
-      entry.latestOverallRank = Number(latest?.rank || Number.MAX_SAFE_INTEGER);
+      entry.latestOverallRank = scoreResult.latestOverallRank;
+      entry.scoreDetails = scoreResult.details || {};
       entry.lastScoreSyncAt = new Date();
       entry.scoreSyncStatus = 'success';
       entry.scoreSyncError = '';
@@ -2969,58 +3119,54 @@ async function syncActiveLeagueScores(limit = FPL_LEAGUE_SYNC_LIMIT) {
   return results;
 }
 
-// Refreshes each member's full squad (starting lineup, bench, captain, points per
-// player) once a day so that teammates viewing each other's teams always see
-// current data, even for members who never manually hit "Sync Team" themselves.
-// Only members of currently active leagues are refreshed, prioritising whoever has
-// gone longest without a snapshot, and the batch size is capped per run so a large
-// member base doesn't overload the FPL API in a single invocation.
+// Refresh every active linked user's full public FPL squad once per UTC day.
+// Manual syncing is no longer part of the normal user workflow. The batch cap is
+// only a safety valve for very large installs; page reads still refresh on demand.
 async function refreshMemberTeamSnapshots(limit = FPL_TEAM_SNAPSHOT_SYNC_LIMIT) {
-  const activeLeagueIds = await League.find({
-    status: { $in: ['open', 'full', 'upcoming', 'live', 'awaiting-review'] },
-  }).distinct('_id');
+  const dayStart = utcDayStart(new Date());
+  const users = await User.find({
+    role: 'user',
+    status: 'active',
+    fplManagerId: { $type: 'string', $ne: '' },
+  }).select('_id fullName fplManagerId fantasyTeamName').lean();
+  if (!users.length) return { checked: 0, refreshed: 0, failed: 0, skippedAlreadyFresh: 0 };
 
-  const candidates = await LeagueEntry.aggregate([
-    { $match: { leagueId: { $in: activeLeagueIds }, paymentStatus: 'paid' } },
-    { $group: { _id: '$userId' } },
-    { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } },
-    { $unwind: '$user' },
-    { $match: { 'user.fplManagerId': { $nin: [null, ''] } } },
-    {
-      $lookup: {
-        from: 'teamsnapshots',
-        let: { uid: '$_id' },
-        pipeline: [
-          { $match: { $expr: { $eq: ['$userId', '$$uid'] } } },
-          { $sort: { fetchedAt: -1 } },
-          { $limit: 1 },
-          { $project: { fetchedAt: 1 } },
-        ],
-        as: 'latestSnapshot',
-      },
-    },
-    { $addFields: { latestFetchedAt: { $ifNull: [{ $arrayElemAt: ['$latestSnapshot.fetchedAt', 0] }, new Date(0)] } } },
-    { $sort: { latestFetchedAt: 1 } },
-    { $limit: limit },
-    { $project: { userId: '$_id', fplManagerId: '$user.fplManagerId' } },
+  const latest = await TeamSnapshot.aggregate([
+    { $match: { userId: { $in: users.map((user) => user._id) }, syncStatus: 'success' } },
+    { $sort: { fetchedAt: -1, updatedAt: -1 } },
+    { $group: { _id: '$userId', fetchedAt: { $first: '$fetchedAt' } } },
   ]);
+  const latestMap = new Map(latest.map((item) => [String(item._id), item.fetchedAt]));
+  const staleUsers = users.filter((user) => !latestMap.get(String(user._id)) || new Date(latestMap.get(String(user._id))) < dayStart);
+  const candidates = staleUsers.slice(0, limit);
 
   let refreshed = 0;
   let failed = 0;
-  for (const candidate of candidates) {
-    try {
-      const { snapshot } = await loadFantasyTeam(candidate.fplManagerId);
-      await TeamSnapshot.create({ userId: candidate.userId, ...snapshot });
-      refreshed += 1;
-    } catch (error) {
-      failed += 1;
-      console.error('Member team snapshot refresh failed', candidate.userId, error.message);
-    }
+  const concurrency = 4;
+  for (let offset = 0; offset < candidates.length; offset += concurrency) {
+    const batch = candidates.slice(offset, offset + concurrency);
+    const outcomes = await Promise.all(batch.map(async (user) => {
+      try {
+        await persistFantasyTeamSnapshot(user, { force: true });
+        return true;
+      } catch (error) {
+        console.error('Daily FPL team refresh failed', user._id, error.message);
+        return false;
+      }
+    }));
+    refreshed += outcomes.filter(Boolean).length;
+    failed += outcomes.filter((value) => !value).length;
   }
-  return { checked: candidates.length, refreshed, failed };
+  return {
+    checked: users.length,
+    refreshed,
+    failed,
+    skippedAlreadyFresh: users.length - staleUsers.length,
+    remainingAfterLimit: Math.max(0, staleUsers.length - candidates.length),
+  };
 }
 
-async function buildTeamPayload(user) {
+async function buildTeamPayload(user, { refresh = false } = {}) {
   if (!user.fplManagerId) return { linked: false, providerMode: FPL_DATA_MODE };
 
   const [latest, lastEntry] = await Promise.all([
@@ -3031,28 +3177,36 @@ async function buildTeamPayload(user) {
   let providerData = null;
   let providerWarning = '';
   let syncAvailable = true;
-  try {
-    providerData = await loadFantasyTeam(user.fplManagerId);
-  } catch (error) {
-    syncAvailable = false;
-    providerWarning = latest
-      ? `${error.message} Showing the last successful sync instead.`
-      : `${error.message} Your FPL account is linked; full team sync will become available when FPL publishes gameweek team data.`;
-  }
-
-  const latestMatchesMode = latest && latest.providerMode === FPL_DATA_MODE;
-  const snapshot = latestMatchesMode ? latest : providerData?.snapshot || latest || null;
-
-  let basicManager = null;
-  if (!providerData?.manager) {
+  if (refresh) {
     try {
-      basicManager = await fantasyProvider.getManager(user.fplManagerId);
+      // Automatic page refreshes respect a short cache. Users still see cached
+      // content immediately; stale data is refreshed without a manual button.
+      providerData = await persistFantasyTeamSnapshot(user, { force: false });
     } catch (error) {
-      basicManager = null;
+      syncAvailable = false;
+      providerWarning = latest
+        ? `${error.message} Showing the last successful automatic refresh instead.`
+        : `${error.message} Your FPL account is linked; team data will appear as soon as FPL publishes it.`;
     }
   }
 
-  const manager = providerData?.manager || basicManager || {
+  const refreshedSnapshot = providerData?.snapshot?.toObject ? providerData.snapshot.toObject() : providerData?.snapshot;
+  const snapshot = refreshedSnapshot || latest || null;
+  let manager = providerData?.manager || null;
+  let history = providerData?.history || [];
+
+  // Never make live FPL requests during the fast cached-first render. If this is
+  // the follow-up refresh request, manager/history can be completed in parallel.
+  if (refresh && (!manager || !history.length)) {
+    const [managerResult, historyResult] = await Promise.allSettled([
+      manager ? Promise.resolve(manager) : fantasyProvider.getManager(user.fplManagerId),
+      history.length ? Promise.resolve(history) : fantasyProvider.getManagerHistory(user.fplManagerId),
+    ]);
+    if (!manager && managerResult.status === 'fulfilled') manager = managerResult.value;
+    if (!history.length && historyResult.status === 'fulfilled') history = historyResult.value;
+  }
+
+  manager = manager || {
     managerId: user.fplManagerId,
     teamName: snapshot?.teamName || user.fantasyTeamName || '',
     managerName: snapshot?.managerName || '',
@@ -3061,9 +3215,10 @@ async function buildTeamPayload(user) {
   return {
     linked: true,
     manager,
-    history: providerData?.history || [],
+    history,
     snapshot,
     syncAvailable,
+    autoSynced: Boolean(refreshedSnapshot && !providerData?.cached),
     providerMode: FPL_DATA_MODE,
     providerWarning,
     lastConfirmation: lastEntry?.lastConfirmedGameweek || 0,
@@ -3072,27 +3227,26 @@ async function buildTeamPayload(user) {
 }
 
 app.get('/api/team', requireAuth, async (req, res, next) => {
-  try { return success(res, await buildTeamPayload(req.user)); } catch (error) { next(error); }
+  try {
+    const refresh = String(req.query.refresh || '') === '1';
+    return success(res, await buildTeamPayload(req.user, { refresh }));
+  } catch (error) { next(error); }
 });
 
 app.post('/api/team/sync', requireAuth, writeLimiter, async (req, res, next) => {
   try {
     const managerId = normalizeManagerId(req.body.managerId || req.user.fplManagerId);
-    const { manager, history, snapshot: normalizedSnapshot } = await loadFantasyTeam(managerId);
-
-    await linkFantasyManagerToUser(req.user, managerId, manager.teamName);
-
-    const snapshot = await TeamSnapshot.create({
-      userId: req.user._id,
-      ...normalizedSnapshot,
-    });
-
+    if (managerId !== String(req.user.fplManagerId || '')) {
+      const manager = await fantasyProvider.getManager(managerId);
+      await linkFantasyManagerToUser(req.user, managerId, manager.teamName);
+    }
+    const refreshed = await persistFantasyTeamSnapshot(req.user, { force: true });
     return success(res, {
-      snapshot,
-      history,
-      manager,
+      snapshot: refreshed.snapshot,
+      history: refreshed.history,
+      manager: refreshed.manager,
       demo: MOCK_FANTASY,
-      message: MOCK_FANTASY ? 'Fantasy team synchronised.' : 'Official FPL team synchronised successfully.',
+      message: 'Official FPL data refreshed. Team pages now refresh automatically when opened.',
     });
   } catch (error) { next(error); }
 });
@@ -3148,7 +3302,7 @@ app.get('/api/fpl/gameweeks', requireAuth, async (req, res, next) => {
 
 app.get('/api/leagues', requireAuth, async (req, res, next) => {
   try {
-    await refreshLeagueLifecycleIfStale();
+    if (String(req.query.refresh || '') === '1') await refreshLeagueLifecycleIfStale();
     const { scope = 'discover', status, type } = req.query;
     let query = {};
     if (scope === 'mine') {
@@ -3160,9 +3314,27 @@ app.get('/api/leagues', requireAuth, async (req, res, next) => {
     }
     if (status) query.status = status;
     if (type) query.competitionType = type;
-    const leagues = await League.find(query).sort({ officialSupremeLeague: -1, createdAt: -1 }).limit(100);
+    const leagues = await League.find(query).sort({ officialSupremeLeague: -1, fplJoinDeadlineAt: 1, startGameweek: 1, createdAt: -1 }).limit(100);
     const views = await Promise.all(leagues.map((league) => leagueView(league, req.user._id)));
-    return success(res, { leagues: scope === 'discover' ? views.filter((league) => !league.isPast) : views });
+    const visible = scope === 'discover' ? views.filter((league) => !league.isPast) : views;
+    const timestamp = (value) => {
+      const date = value ? new Date(value) : null;
+      return date && !Number.isNaN(date.getTime()) ? date.getTime() : Number.MAX_SAFE_INTEGER;
+    };
+    visible.sort((a, b) => {
+      if (Boolean(a.joinOpen) !== Boolean(b.joinOpen)) return a.joinOpen ? -1 : 1;
+      if (a.joinOpen && b.joinOpen) {
+        const deadlineDelta = timestamp(a.joinDeadlineAt) - timestamp(b.joinDeadlineAt);
+        if (deadlineDelta) return deadlineDelta;
+        const gameweekDelta = Number(a.startGameweek || 99) - Number(b.startGameweek || 99);
+        if (gameweekDelta) return gameweekDelta;
+      }
+      const aLive = ['live', 'awaiting-review'].includes(a.status);
+      const bLive = ['live', 'awaiting-review'].includes(b.status);
+      if (aLive !== bLive) return aLive ? -1 : 1;
+      return Number(a.startGameweek || 0) - Number(b.startGameweek || 0);
+    });
+    return success(res, { leagues: visible });
   } catch (error) { next(error); }
 });
 
@@ -3307,10 +3479,26 @@ app.post('/api/leagues', requireAuth, writeLimiter, async (req, res, next) => {
 
 app.get('/api/leagues/:leagueId', requireAuth, async (req, res, next) => {
   try {
-    await refreshLeagueLifecycleIfStale();
+    const refreshRequested = String(req.query.refresh || '') === '1';
+    if (refreshRequested) await refreshLeagueLifecycleIfStale();
     if (!mongoose.isValidObjectId(req.params.leagueId)) return failure(res, 404, 'League not found.');
-    const league = await League.findById(req.params.leagueId);
+    let league = await League.findById(req.params.leagueId);
     if (!league) return failure(res, 404, 'League not found.');
+    // The first request renders cached standings immediately. The frontend then
+    // issues ?refresh=1 automatically, so live FPL work never blocks navigation.
+    if (refreshRequested && league.officialSupremeLeague && FPL_DATA_MODE === 'public') {
+      try { await localGrowth.settleLeagueById(league._id, { forceDataChecked: false, trigger: 'user-league-page' }); }
+      catch (settlementError) { console.warn('Opportunistic Supreme settlement skipped:', settlementError.message); }
+      league = await League.findById(league._id);
+    }
+    if (refreshRequested) {
+      try {
+        const refreshed = await syncLeagueScores(league._id, { force: false });
+        league = refreshed.league;
+      } catch (syncError) {
+        console.warn('League page score refresh failed:', syncError.message);
+      }
+    }
     const entry = await LeagueEntry.findOne({ leagueId: league._id, userId: req.user._id });
     const isCreator = String(league.createdBy || '') === String(req.user._id);
     if (league.inviteOnly && !isCreator && !entry) return failure(res, 403, 'Use the league code page to access this private league.');
@@ -3324,212 +3512,19 @@ app.post('/api/leagues/:leagueId/join', requireAuth, writeLimiter, async (req, r
   return failure(res, 409, 'Choose Wallet balance or Paynow in the league checkout. Wallet deductions require an explicit confirmation.');
 });
 
-function formatActiveChipLabel(chip) {
+function leaderboardChipLabel(chip) {
   const value = String(chip || '').trim().toLowerCase();
   if (!value || value === 'none' || value === 'null') return 'No chip';
-  const map = {
-    wildcard: 'Wildcard',
-    freehit: 'Free Hit',
-    bboost: 'Bench Boost',
-    '3xc': 'Triple Captain',
-    manager: 'Manager',
-    assistant_manager: 'Assistant Manager',
-  };
-  return map[value] || value.replace(/[-_]/g, ' ').split(' ').map((part) => part ? part.charAt(0).toUpperCase() + part.slice(1) : '').join(' ');
+  const labels = { wildcard: 'Wildcard', freehit: 'Free Hit', bboost: 'Bench Boost', '3xc': 'Triple Captain', manager: 'Manager', assistant_manager: 'Assistant Manager' };
+  return labels[value] || value.replace(/[-_]/g, ' ').split(' ').map((part) => part ? part.charAt(0).toUpperCase() + part.slice(1) : '').join(' ');
 }
 
-async function buildGameweekAvailabilityContexts(gameweeks = []) {
-  const distinct = [...new Set((Array.isArray(gameweeks) ? gameweeks : []).map((value) => Number(value)).filter((value) => Number.isInteger(value) && value > 0))];
-  if (!distinct.length) return new Map();
-
-  let bootstrap = null;
-  try {
-    bootstrap = await fantasyProvider.getBootstrap();
-  } catch (error) {
-    console.error('Failed to load FPL bootstrap for leaderboard availability context', error.message);
-    return new Map();
-  }
-
-  const teamMap = new Map((bootstrap?.teams || []).map((team) => [Number(team.id), team]));
-  const contexts = new Map();
-
-  await Promise.all(distinct.map(async (gameweek) => {
-    try {
-      const fixtures = await fetchFplJson(`/fixtures/?event=${gameweek}`, { cacheMinutes: 1 });
-      const teamRemaining = new Map();
-      for (const [teamId] of teamMap.entries()) {
-        const relevantFixtures = (Array.isArray(fixtures) ? fixtures : []).filter((fixture) => Number(fixture.team_h) === teamId || Number(fixture.team_a) === teamId);
-        const hasRemainingFixture = relevantFixtures.length ? relevantFixtures.some((fixture) => !fixture.finished) : false;
-        teamRemaining.set(teamId, hasRemainingFixture);
-      }
-      const byClub = new Map();
-      for (const [teamId, team] of teamMap.entries()) {
-        const keys = [team.short_name, team.name].filter(Boolean).map((value) => String(value).trim().toLowerCase());
-        keys.forEach((key) => byClub.set(key, teamId));
-      }
-      contexts.set(gameweek, { gameweek, teamRemaining, byClub });
-    } catch (error) {
-      console.error('Failed to build leaderboard availability context for GW', gameweek, error.message);
-    }
-  }));
-
-  return contexts;
+function optionalManagerId(value) {
+  const normalized = String(value || '').trim();
+  return /^\d+$/.test(normalized) ? normalized : null;
 }
 
-function getLineupTeamId(player, context) {
-  const direct = Number(player?.teamId || 0);
-  if (Number.isInteger(direct) && direct > 0) return direct;
-  const club = String(player?.club || player?.teamName || '').trim().toLowerCase();
-  if (!club || !context?.byClub) return null;
-  return context.byClub.get(club) || null;
-}
-
-function buildLeaderboardRowLiveMetrics(snapshot, context) {
-  const activeChip = snapshot?.activeChip || 'None';
-  const benchBoost = String(activeChip || '').trim().toLowerCase() === 'bboost';
-  const allLineup = Array.isArray(snapshot?.lineup) ? snapshot.lineup : [];
-  const countedPlayers = allLineup.filter((player) => benchBoost || Boolean(player?.starter));
-  const totalPlayers = countedPlayers.length || (benchBoost ? 15 : 11);
-
-  if (!context || !countedPlayers.length) {
-    return {
-      playersRemaining: null,
-      playersPlayed: null,
-      totalPlayers,
-      playersRemainingPercent: null,
-      playersRemainingLabel: '—',
-      activeChip,
-      activeChipLabel: formatActiveChipLabel(activeChip),
-      chipUsed: Boolean(activeChip && String(activeChip).toLowerCase() !== 'none'),
-      transfers: Number(snapshot?.transfers || 0),
-      transferCost: Number(snapshot?.transferCost || 0),
-      liveGameweek: Number(snapshot?.gameweek || 0) || null,
-      usesBenchBoost: benchBoost,
-    };
-  }
-
-  let playersRemaining = 0;
-  for (const player of countedPlayers) {
-    const teamId = getLineupTeamId(player, context);
-    if (teamId && context.teamRemaining.get(teamId)) playersRemaining += 1;
-  }
-  const playersPlayed = Math.max(totalPlayers - playersRemaining, 0);
-  const playersRemainingPercent = totalPlayers ? Math.round((playersRemaining / totalPlayers) * 100) : null;
-  return {
-    playersRemaining,
-    playersPlayed,
-    totalPlayers,
-    playersRemainingPercent,
-    playersRemainingLabel: totalPlayers ? `${playersRemaining}/${totalPlayers} (${playersRemainingPercent}%)` : '—',
-    activeChip,
-    activeChipLabel: formatActiveChipLabel(activeChip),
-    chipUsed: Boolean(activeChip && String(activeChip).toLowerCase() !== 'none'),
-    transfers: Number(snapshot?.transfers || 0),
-    transferCost: Number(snapshot?.transferCost || 0),
-    liveGameweek: Number(snapshot?.gameweek || 0) || null,
-    usesBenchBoost: benchBoost,
-  };
-}
-
-async function asyncMapLimit(items, limit, mapper) {
-  const list = Array.isArray(items) ? items : [];
-  const capped = Math.max(1, Number(limit) || 1);
-  const results = new Array(list.length);
-  let cursor = 0;
-
-  async function worker() {
-    while (cursor < list.length) {
-      const index = cursor;
-      cursor += 1;
-      results[index] = await mapper(list[index], index);
-    }
-  }
-
-  const workers = Array.from({ length: Math.min(capped, list.length) }, () => worker());
-  await Promise.all(workers);
-  return results;
-}
-
-async function resolveLeaderboardParticipantSnapshot(userDoc, fallbackSnapshot = null) {
-  const managerId = normalizeManagerId(userDoc?.fplManagerId || '');
-  if (!managerId) return fallbackSnapshot;
-  try {
-    const providerData = await loadFantasyTeam(managerId);
-    return providerData?.snapshot || fallbackSnapshot;
-  } catch (error) {
-    return fallbackSnapshot;
-  }
-}
-
-function textToSvg(value) {
-  return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
-}
-
-function leaderboardTransferLabel(row) {
-  const transfers = Number(row?.transfers || 0);
-  const cost = Number(row?.transferCost || 0);
-  if (!transfers) return '0';
-  return cost > 0 ? `${transfers} (-${cost})` : `${transfers}`;
-}
-
-function buildLeagueLeaderboardShareSvg(league, rows = []) {
-  const topRows = (Array.isArray(rows) ? rows : []).slice(0, 5);
-  const width = 1400;
-  const rowHeight = 94;
-  const height = 280 + (topRows.length * rowHeight);
-  const subtitle = league?.scoreThroughGameweek
-    ? `Top 5 • Scored through GW ${league.scoreThroughGameweek}`
-    : `Top 5 • ${league?.status ? formatActiveChipLabel(String(league.status).replace(/\s+/g, '-')) : 'Leaderboard'}`;
-  const rowsSvg = topRows.map((row, index) => {
-    const y = 205 + (index * rowHeight);
-    return `
-      <rect x="36" y="${y - 34}" width="1328" height="78" rx="22" fill="rgba(255,255,255,0.045)" stroke="rgba(255,255,255,0.08)" />
-      <text x="64" y="${y + 12}" font-size="36" fill="#f8fafc" font-weight="800">${textToSvg(row.rank)}</text>
-      <text x="140" y="${y - 4}" font-size="30" fill="#f8fafc" font-weight="700">${textToSvg(row.name)}</text>
-      <text x="140" y="${y + 26}" font-size="21" fill="#94a3b8">${textToSvg(row.teamName || row.managerName || '')}</text>
-      <text x="770" y="${y - 4}" font-size="28" fill="#f8fafc" font-weight="700" text-anchor="end">${textToSvg(row.score ?? 0)} pts</text>
-      <text x="1030" y="${y - 4}" font-size="22" fill="#cbd5e1" text-anchor="end">${textToSvg(row.playersRemainingLabel || '—')}</text>
-      <text x="1200" y="${y - 4}" font-size="22" fill="#cbd5e1" text-anchor="end">${textToSvg(row.activeChipLabel || 'No chip')}</text>
-      <text x="1325" y="${y - 4}" font-size="22" fill="#cbd5e1" text-anchor="end">${textToSvg(leaderboardTransferLabel(row))}</text>
-    `;
-  }).join('');
-
-  return `
-  <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
-    <defs>
-      <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0%" stop-color="#020617" />
-        <stop offset="50%" stop-color="#0f172a" />
-        <stop offset="100%" stop-color="#111827" />
-      </linearGradient>
-      <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
-        <stop offset="0%" stop-color="#38bdf8" />
-        <stop offset="100%" stop-color="#22c55e" />
-      </linearGradient>
-    </defs>
-    <rect width="100%" height="100%" fill="url(#bg)" rx="32" />
-    <rect x="36" y="32" width="220" height="10" rx="999" fill="url(#accent)" />
-    <text x="36" y="78" font-size="27" fill="#38bdf8" font-weight="800">SUPREME FANTASY LEAGUE</text>
-    <text x="36" y="128" font-size="50" fill="#f8fafc" font-weight="800">${textToSvg(league?.name || 'League leaderboard')}</text>
-    <text x="36" y="165" font-size="24" fill="#94a3b8">${textToSvg(subtitle)}</text>
-    <text x="36" y="212" font-size="18" fill="#64748b">Rank</text>
-    <text x="140" y="212" font-size="18" fill="#64748b">Player</text>
-    <text x="770" y="212" font-size="18" fill="#64748b" text-anchor="end">Points</text>
-    <text x="1030" y="212" font-size="18" fill="#64748b" text-anchor="end">Players left</text>
-    <text x="1200" y="212" font-size="18" fill="#64748b" text-anchor="end">Chip</text>
-    <text x="1325" y="212" font-size="18" fill="#64748b" text-anchor="end">Transfers</text>
-    ${rowsSvg}
-    <text x="36" y="${height - 20}" font-size="16" fill="#64748b">Players left counts the starting 11 only, unless Bench Boost is active, in which case all 15 players are counted.</text>
-  </svg>`;
-}
-
-async function getLeagueLeaderboard(leagueId, currentUserId, options = {}) {
-  const { liveMetrics = true } = options;
+async function getLeagueLeaderboard(leagueId, currentUserId) {
   const entries = await LeagueEntry.find({ leagueId, paymentStatus: 'paid' })
     .sort({ currentScore: -1, latestOverallRank: 1, joinedAt: 1 })
     .populate('userId', 'fullName fantasyTeamName fplManagerId')
@@ -3539,7 +3534,7 @@ async function getLeagueLeaderboard(leagueId, currentUserId, options = {}) {
     UserProfile.find({ userId: { $in: userIds } }).select('userId profilePicture').lean(),
     TeamSnapshot.find({ userId: { $in: userIds }, syncStatus: 'success' })
       .sort({ fetchedAt: -1, createdAt: -1 })
-      .select('userId gameweek teamName managerName activeChip transfers transferCost lineup fetchedAt')
+      .select('userId teamName managerName activeChip transfers transferCost fetchedAt')
       .lean(),
   ]);
   const profileMap = new Map(profiles.map((profile) => [String(profile.userId), profile.profilePicture]));
@@ -3549,30 +3544,9 @@ async function getLeagueLeaderboard(leagueId, currentUserId, options = {}) {
     if (!snapshotMap.has(key)) snapshotMap.set(key, snapshot);
   }
 
-  const resolvedSnapshots = new Map();
-  if (liveMetrics) {
-    const hydrated = await asyncMapLimit(entries, 4, async (entry) => {
-      const userId = String(entry.userId?._id || '');
-      const fallbackSnapshot = snapshotMap.get(userId) || null;
-      const resolved = await resolveLeaderboardParticipantSnapshot(entry.userId, fallbackSnapshot);
-      return { userId, snapshot: resolved || fallbackSnapshot };
-    });
-    hydrated.forEach((item) => {
-      if (item?.userId) resolvedSnapshots.set(item.userId, item.snapshot || null);
-    });
-  }
-
-  const availabilityContexts = await buildGameweekAvailabilityContexts(
-    entries.map((entry) => {
-      const userId = String(entry.userId?._id || '');
-      return (resolvedSnapshots.get(userId) || snapshotMap.get(userId) || {}).gameweek;
-    })
-  );
-
   return entries.map((entry, index) => {
     const userId = String(entry.userId?._id || '');
-    const snapshot = resolvedSnapshots.get(userId) || snapshotMap.get(userId) || null;
-    const liveMetricsRow = buildLeaderboardRowLiveMetrics(snapshot, availabilityContexts.get(Number(snapshot?.gameweek || 0)));
+    const snapshot = snapshotMap.get(userId) || null;
     return {
       rank: index + 1,
       userId: entry.userId?._id,
@@ -3583,11 +3557,103 @@ async function getLeagueLeaderboard(leagueId, currentUserId, options = {}) {
       score: entry.currentScore,
       eligibilityStatus: entry.eligibilityStatus,
       prizeCents: entry.prizeCents,
+      activeChip: snapshot ? (snapshot.activeChip || 'None') : null,
+      activeChipLabel: snapshot ? leaderboardChipLabel(snapshot.activeChip) : '—',
+      chipUsed: Boolean(snapshot?.activeChip && String(snapshot.activeChip).toLowerCase() !== 'none'),
+      transfers: snapshot?.transfers != null ? Number(snapshot.transfers || 0) : null,
+      transferCost: snapshot?.transferCost != null ? Number(snapshot.transferCost || 0) : null,
       isCurrentUser: userId === String(currentUserId),
-      ...liveMetricsRow,
-      lastTeamSyncAt: snapshot?.fetchedAt || null,
     };
   });
+}
+
+async function getFreshLeaderboardShareRows(leagueId, currentUserId, limit = 5) {
+  const entries = await LeagueEntry.find({ leagueId, paymentStatus: 'paid' })
+    .sort({ currentScore: -1, latestOverallRank: 1, joinedAt: 1 })
+    .limit(limit)
+    .populate('userId', 'fullName fantasyTeamName fplManagerId')
+    .lean();
+
+  const rows = await Promise.all(entries.map(async (entry, index) => {
+    const managerId = optionalManagerId(entry.fantasyManagerId || entry.userId?.fplManagerId);
+    let teamName = entry.userId?.fantasyTeamName || '';
+    let activeChip = null;
+    let transfers = null;
+    let transferCost = null;
+
+    if (managerId) {
+      try {
+        const provider = await loadFantasyTeam(managerId);
+        teamName = provider?.snapshot?.teamName || teamName;
+        activeChip = provider?.snapshot ? (provider.snapshot.activeChip || 'None') : null;
+        const gameweek = Number(provider?.snapshot?.gameweek || 0);
+        const historyRow = (provider?.history || []).find((item) => Number(item.gameweek) === gameweek) || null;
+        transfers = historyRow ? Number(historyRow.transfers || 0) : null;
+        transferCost = historyRow ? Number(historyRow.transferCost || 0) : null;
+      } catch (error) {
+        console.warn(`Leaderboard card live FPL metadata unavailable for ${entry.userId?.fullName || managerId}:`, error.message);
+      }
+    }
+
+    return {
+      rank: index + 1,
+      userId: entry.userId?._id,
+      name: entry.userId?.fullName || 'Supreme Player',
+      teamName,
+      score: Number(entry.currentScore || 0),
+      activeChip,
+      activeChipLabel: activeChip == null ? '—' : leaderboardChipLabel(activeChip),
+      transfers,
+      transferCost,
+      isCurrentUser: String(entry.userId?._id || '') === String(currentUserId),
+    };
+  }));
+  return rows;
+}
+
+function escapeLeaderboardSvg(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function leaderboardTransferLabel(row) {
+  if (row.transfers == null) return '—';
+  const transfers = Number(row.transfers || 0);
+  const cost = Number(row.transferCost || 0);
+  return cost > 0 ? `${transfers} (-${cost})` : `${transfers}`;
+}
+
+function buildLeaderboardShareSvg(league, rows) {
+  const width = 1400;
+  const rowHeight = 96;
+  const height = 300 + (rows.length * rowHeight);
+  const rendered = rows.map((row, index) => {
+    const y = 280 + (index * rowHeight);
+    return `
+      <rect x="38" y="${y - 34}" width="1324" height="80" rx="22" fill="rgba(255,255,255,0.045)" stroke="rgba(255,255,255,0.08)" />
+      <text x="68" y="${y + 13}" font-size="36" fill="#f8fafc" font-weight="800">${escapeLeaderboardSvg(row.rank)}</text>
+      <text x="145" y="${y - 5}" font-size="30" fill="#f8fafc" font-weight="700">${escapeLeaderboardSvg(row.name)}</text>
+      <text x="145" y="${y + 26}" font-size="21" fill="#94a3b8">${escapeLeaderboardSvg(row.teamName || '')}</text>
+      <text x="850" y="${y - 4}" font-size="29" fill="#f8fafc" font-weight="800" text-anchor="end">${escapeLeaderboardSvg(row.score)} pts</text>
+      <text x="1160" y="${y - 4}" font-size="22" fill="#cbd5e1" text-anchor="end">${escapeLeaderboardSvg(row.activeChipLabel || 'No chip')}</text>
+      <text x="1325" y="${y - 4}" font-size="22" fill="#cbd5e1" text-anchor="end">${escapeLeaderboardSvg(leaderboardTransferLabel(row))}</text>`;
+  }).join('');
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+    <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#020617"/><stop offset="55%" stop-color="#0f172a"/><stop offset="100%" stop-color="#111827"/></linearGradient><linearGradient id="accent" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#38bdf8"/><stop offset="100%" stop-color="#22c55e"/></linearGradient></defs>
+    <rect width="100%" height="100%" rx="32" fill="url(#bg)"/>
+    <rect x="38" y="32" width="235" height="10" rx="999" fill="url(#accent)"/>
+    <text x="38" y="78" font-size="27" fill="#38bdf8" font-weight="800">SUPREME FANTASY LEAGUE</text>
+    <text x="38" y="130" font-size="50" fill="#f8fafc" font-weight="800">${escapeLeaderboardSvg(league.name || 'League leaderboard')}</text>
+    <text x="38" y="164" font-size="23" fill="#94a3b8">Top 5${league.scoreThroughGameweek ? ` • Scored through Gameweek ${league.scoreThroughGameweek}` : ''}</text>
+    <text x="38" y="220" font-size="18" fill="#64748b">Rank</text><text x="145" y="220" font-size="18" fill="#64748b">Player</text><text x="850" y="220" font-size="18" fill="#64748b" text-anchor="end">Points</text><text x="1160" y="220" font-size="18" fill="#64748b" text-anchor="end">Chip</text><text x="1325" y="220" font-size="18" fill="#64748b" text-anchor="end">Transfers</text>
+    ${rendered}
+    <text x="38" y="${height - 20}" font-size="16" fill="#64748b">Generated from Supreme Fantasy League backend data. Chip and transfer metadata are refreshed from FPL when available.</text>
+  </svg>`;
 }
 
 app.get('/api/leagues/:leagueId/leaderboard-card', requireAuth, async (req, res, next) => {
@@ -3595,16 +3661,18 @@ app.get('/api/leagues/:leagueId/leaderboard-card', requireAuth, async (req, res,
     if (!mongoose.isValidObjectId(req.params.leagueId)) return failure(res, 404, 'League not found.');
     const league = await League.findById(req.params.leagueId);
     if (!league) return failure(res, 404, 'League not found.');
-    const entry = await LeagueEntry.findOne({ leagueId: league._id, userId: req.user._id });
+    const entry = await LeagueEntry.findOne({ leagueId: league._id, userId: req.user._id }).lean();
     const isCreator = String(league.createdBy || '') === String(req.user._id);
     if (league.inviteOnly && !isCreator && !entry) return failure(res, 403, 'Use the league code page to access this private league.');
-
-    const leaderboard = await getLeagueLeaderboard(league._id, req.user._id, { liveMetrics: true });
-    const svg = buildLeagueLeaderboardShareSvg(league, leaderboard);
-    const safeName = String(league.name || 'league-leaderboard').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'league-leaderboard';
+    try { await syncLeagueScores(league._id, { force: false }); }
+    catch (error) { console.warn(`Leaderboard card score refresh skipped for ${league._id}:`, error.message); }
+    const freshLeague = await League.findById(league._id) || league;
+    const rows = await getFreshLeaderboardShareRows(freshLeague._id, req.user._id, 5);
+    const safeName = String(freshLeague.name || 'league-leaderboard').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'league-leaderboard';
     res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}-top-5.svg"`);
-    return res.status(200).send(svg);
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(200).send(buildLeaderboardShareSvg(freshLeague, rows));
   } catch (error) { next(error); }
 });
 
@@ -3631,8 +3699,25 @@ app.post('/api/leagues/:leagueId/sync-scores', requireAuth, writeLimiter, async 
 });
 
 app.get('/api/leagues/:leagueId/leaderboard', requireAuth, async (req, res, next) => {
-  try { return success(res, { leaderboard: await getLeagueLeaderboard(req.params.leagueId, req.user._id) }); } catch (error) { next(error); }
+  try {
+    if (String(req.query.refresh || '') === '1') {
+      await refreshLeagueLifecycleIfStale();
+      await syncLeagueScores(req.params.leagueId, { force: false });
+    }
+    return success(res, { leaderboard: await getLeagueLeaderboard(req.params.leagueId, req.user._id) });
+  } catch (error) { next(error); }
 });
+
+async function syncUserLeagueScores(userId, { force = false, limit = 20 } = {}) {
+  const entries = await LeagueEntry.find({ userId, paymentStatus: 'paid' }).sort({ updatedAt: -1 }).select('leagueId').lean();
+  const leagueIds = [...new Set(entries.map((entry) => String(entry.leagueId)).filter(Boolean))].slice(0, limit);
+  const results = [];
+  for (const leagueId of leagueIds) {
+    try { results.push(await syncLeagueScores(leagueId, { force })); }
+    catch (error) { console.warn(`Automatic league score refresh failed for ${leagueId}:`, error.message); }
+  }
+  return results;
+}
 
 // -----------------------------------------------------------------------------
 // Wallet, Paynow checkout, transaction and subscription endpoints
@@ -4633,7 +4718,7 @@ app.post('/api/subscription/select', requireAuth, writeLimiter, async (req, res)
 // -----------------------------------------------------------------------------
 // Leaderboards and dashboard
 // -----------------------------------------------------------------------------
-async function competitionLeaderboards(currentUserId) {
+async function competitionLeaderboards(currentUserId, { refreshScores = false } = {}) {
   const categories = [
     ['Weekly Cup', 'weekly'],
     ['Bi-Weekly Cup', 'bi-weekly'],
@@ -4641,15 +4726,29 @@ async function competitionLeaderboards(currentUserId) {
     ['Half-Season Cup', 'half-season'],
     ['Season Cup', 'season'],
   ];
+  const now = new Date();
 
-  const boards = [];
-  for (const [name, key] of categories) {
-    const league = await League.findOne({
-      $or: [{ cadence: key }, { competitionType: key }],
-      status: { $in: ['open', 'full', 'upcoming', 'live', 'awaiting-review', 'settled'] },
-    }).sort({ officialSupremeLeague: -1, startGameweek: -1, createdAt: -1 });
+  return Promise.all(categories.map(async ([name, key]) => {
+    const categoryQuery = { $or: [{ cadence: key }, { competitionType: key }] };
+    let league = await League.findOne({
+      ...categoryQuery,
+      status: { $in: ['open', 'upcoming'] },
+      fplJoinDeadlineAt: { $gt: now },
+    }).sort({ fplJoinDeadlineAt: 1, startGameweek: 1, officialSupremeLeague: -1, createdAt: 1 });
 
-    boards.push({
+    if (!league) {
+      league = await League.findOne({
+        ...categoryQuery,
+        status: { $in: ['live', 'awaiting-review', 'settled', 'open', 'full', 'upcoming'] },
+      }).sort({ startGameweek: -1, officialSupremeLeague: -1, createdAt: -1 });
+    }
+
+    if (league && refreshScores) {
+      try { await syncLeagueScores(league._id, { force: false }); }
+      catch (error) { console.warn(`Leaderboard refresh failed for ${league._id}:`, error.message); }
+    }
+
+    return {
       key,
       name,
       leagueId: league?._id || null,
@@ -4658,45 +4757,110 @@ async function competitionLeaderboards(currentUserId) {
       scoreThroughGameweek: league?.scoreThroughGameweek || 0,
       lastScoredAt: league?.lastScoredAt || null,
       rows: league ? await getLeagueLeaderboard(league._id, currentUserId) : [],
-    });
-  }
-  return boards;
+    };
+  }));
+}
+
+async function dashboardSupremeOffers(userId, limit = 8) {
+  const now = new Date();
+  const leagues = await League.find({
+    officialSupremeLeague: true,
+    status: { $in: ['open', 'upcoming'] },
+    fplJoinDeadlineAt: { $gt: now },
+  })
+    .sort({ fplJoinDeadlineAt: 1, startGameweek: 1 })
+    .limit(limit)
+    .select('name description cadence competitionType startGameweek endGameweek entryFeeCents displayedPrizeCents fplJoinDeadlineAt status')
+    .lean();
+  if (!leagues.length) return [];
+  const leagueIds = leagues.map((league) => league._id);
+  const entries = userId
+    ? await LeagueEntry.find({ leagueId: { $in: leagueIds }, userId }).select('leagueId paymentStatus').lean()
+    : [];
+  const joined = new Map(entries.map((entry) => [String(entry.leagueId), entry.paymentStatus]));
+  return leagues.map((league) => ({
+    id: league._id,
+    name: league.name,
+    description: league.description,
+    cadence: league.cadence || league.competitionType,
+    startGameweek: league.startGameweek,
+    endGameweek: league.endGameweek,
+    entryFeeCents: Number(league.entryFeeCents || 0),
+    prizeCents: (league.cadence || league.competitionType) === 'clash-captains'
+      ? nonNegativeIntegerFromEnv('SUPREME_CLASH_CAPTAINS_PRIZE_CENTS', 300)
+      : Number(league.displayedPrizeCents || 0),
+    joinDeadlineAt: league.fplJoinDeadlineAt,
+    status: league.status,
+    joined: joined.get(String(league._id)) === 'paid',
+  }));
+}
+
+function cachedDashboardGameState(team, offers) {
+  const next = (offers || []).find((offer) => offer.joinDeadlineAt && new Date(offer.joinDeadlineAt) > new Date()) || null;
+  const gameweek = Number(team?.snapshot?.gameweek || next?.startGameweek || 0);
+  return {
+    currentGameweek: gameweek,
+    syncGameweek: gameweek,
+    nextDeadline: next?.joinDeadlineAt || null,
+    source: 'cached-platform-data',
+  };
 }
 
 app.get('/api/leaderboards', requireAuth, async (req, res, next) => {
   try {
-    const [competitions, earnings] = await Promise.all([competitionLeaderboards(req.user._id), getEarningsLeaderboard(req.user._id, 10)]);
-    return success(res, { competitions, earnings });
+    const refreshRequested = String(req.query.refresh || '') === '1';
+    if (refreshRequested) await refreshLeagueLifecycleIfStale();
+    const [competitions, earnings] = await Promise.all([
+      competitionLeaderboards(req.user._id, { refreshScores: refreshRequested }),
+      getEarningsLeaderboard(req.user._id, 10),
+    ]);
+    return success(res, { competitions, earnings, refreshing: refreshRequested });
   } catch (error) { next(error); }
 });
 
 app.get('/api/dashboard', requireAuth, async (req, res, next) => {
   try {
-    const [{ wallet }, team, subscription, gameState, entries, transactions, competitions, earningsLeaderboard] = await Promise.all([
+    const refreshRequested = String(req.query.refresh || '') === '1';
+    if (refreshRequested && req.user.fplManagerId) {
+      // This is the non-blocking follow-up request started by the already-rendered
+      // dashboard. Keep the work bounded and cache-aware.
+      await Promise.allSettled([
+        refreshLeagueLifecycleIfStale(),
+        persistFantasyTeamSnapshot(req.user, { force: false }),
+        syncUserLeagueScores(req.user._id, { force: false, limit: 8 }),
+      ]);
+    }
+
+    const [{ wallet }, team, subscription, entries, transactions, competitions, earningsLeaderboard, availableCompetitions] = await Promise.all([
       ensureUserResources(req.user._id),
-      buildTeamPayload(req.user),
+      buildTeamPayload(req.user, { refresh: false }),
       currentSubscription(req.user._id),
-      fantasyProvider.getGameState(),
-      LeagueEntry.find({ userId: req.user._id }).populate('leagueId').sort({ updatedAt: -1 }).lean(),
+      req.user.fplManagerId ? LeagueEntry.find({ userId: req.user._id }).populate('leagueId').sort({ updatedAt: -1 }).limit(30).lean() : Promise.resolve([]),
       Transaction.find({ userId: req.user._id }).sort({ createdAt: -1 }).limit(5).lean(),
-      competitionLeaderboards(req.user._id),
+      req.user.fplManagerId ? competitionLeaderboards(req.user._id, { refreshScores: false }) : Promise.resolve([]),
       getEarningsLeaderboard(req.user._id, 10),
+      dashboardSupremeOffers(req.user._id),
     ]);
 
     const myLeagues = await Promise.all(entries.filter((e) => e.leagueId).map((entry) => leagueView(entry.leagueId, req.user._id)));
     const summary = {
-      gameweekPoints: team.linked ? team.snapshot.gameweekPoints : 0,
-      overallRank: team.linked ? team.snapshot.overallRank : null,
+      gameweekPoints: team.linked ? Number(team.snapshot?.gameweekPoints || 0) : 0,
+      overallRank: team.linked ? (team.snapshot?.overallRank ?? null) : null,
       activeLeagues: myLeagues.filter((l) => ['live', 'open', 'upcoming'].includes(l.status)).length,
       walletBalanceCents: wallet.availableBalanceCents,
       pendingBalanceCents: wallet.pendingBalanceCents,
       subscription: subscription?.planName || 'No active plan',
     };
     return success(res, {
-      gameState,
+      gameState: cachedDashboardGameState(team, availableCompetitions),
       summary,
       myLeagues,
       team,
+      availableCompetitions,
+      onboarding: {
+        needsTeamLink: !Boolean(req.user.fplManagerId),
+        nextStep: req.user.fplManagerId ? 'join-league' : 'link-team',
+      },
       transactions,
       pendingFinancialRequests: transactions.filter((t) => t.status === 'pending'),
       subscription,
@@ -4704,6 +4868,7 @@ app.get('/api/dashboard', requireAuth, async (req, res, next) => {
       earningsLeaderboard,
       demoFunds: MOCK_PAYMENTS,
       providerAvailable: true,
+      refreshing: refreshRequested,
     });
   } catch (error) { next(error); }
 });
@@ -5056,6 +5221,88 @@ app.get('/api/admin/dashboard/analytics', requireAdmin, async (req, res, next) =
   } catch (error) { next(error); }
 });
 
+async function getLeagueSettlementDiagnostics(leagueId, { verifyLive = true } = {}) {
+  const league = await League.findById(leagueId).lean();
+  if (!league) return null;
+  if (league.officialSupremeLeague) {
+    const supreme = await localGrowth.getSettlementDiagnostics(leagueId, { verifyLive });
+    if (supreme) return { type: 'supreme', ...supreme };
+  }
+  let verified = null;
+  if (verifyLive && FPL_DATA_MODE === 'public') {
+    try {
+      verified = await getVerifiedFplRangeState(league.startGameweek, league.endGameweek);
+    } catch (error) {
+      verified = { finished: false, dataChecked: false, reason: error.message, schedules: [] };
+    }
+  }
+  const entries = await LeagueEntry.find({ leagueId }).select('paymentStatus eligibilityStatus scoreSyncStatus scoreSyncError currentScore currentRank fantasyManagerId payoutStatus prizeCents').lean();
+  const eligible = entries.filter((entry) => ['paid', 'completed'].includes(entry.paymentStatus) && entry.eligibilityStatus !== 'ineligible');
+  return {
+    type: 'standard',
+    verified: verified ? {
+      finished: verified.finished,
+      dataChecked: verified.dataChecked,
+      reason: verified.reason,
+      fixtureStates: (verified.schedules || []).map((schedule) => ({ gameweek: schedule.gameweek, eventFinished: schedule.eventFinished, fixturesFinished: schedule.fixturesFinished, fixtureCount: schedule.fixtureCount, dataChecked: schedule.dataChecked })),
+    } : null,
+    participants: entries.length,
+    eligibleParticipants: eligible.length,
+    successfullyScored: eligible.filter((entry) => entry.scoreSyncStatus === 'success').length,
+    scoreFailures: eligible.filter((entry) => entry.scoreSyncStatus === 'failed').map((entry) => entry.scoreSyncError).filter(Boolean),
+    readyForAutomaticSettlement: Boolean(verified?.finished && verified?.dataChecked && eligible.length),
+    canManualSettle: Boolean(verified?.finished && eligible.length),
+  };
+}
+
+async function settleStandardLeagueFromAdmin(leagueId, { adminUserId, reason, forceDataChecked = false } = {}) {
+  const league = await League.findById(leagueId);
+  if (!league) { const error = new Error('League not found.'); error.status = 404; throw error; }
+  if (league.officialSupremeLeague) {
+    return localGrowth.settleLeagueById(leagueId, { manualBy: adminUserId, reason, forceDataChecked });
+  }
+  if (league.status === 'settled') return { settled: true, alreadySettled: true };
+  if (FPL_DATA_MODE !== 'public') { const error = new Error('Manual settlement requires FPL_DATA_MODE=public.'); error.status = 409; throw error; }
+  const verified = await getVerifiedFplRangeState(league.startGameweek, league.endGameweek);
+  if (!verified.finished) { const error = new Error('FPL has not verified that all included gameweeks and fixtures are finished.'); error.status = 409; throw error; }
+  if (!verified.dataChecked && !forceDataChecked) { const error = new Error('FPL has finished the football, but data_checked is still false. Use the explicit manual override only after reviewing the scores.'); error.status = 409; throw error; }
+
+  await syncLeagueScores(league._id, { force: true });
+  const entries = await LeagueEntry.find({ leagueId: league._id, paymentStatus: { $in: ['paid', 'completed'] }, eligibilityStatus: { $ne: 'ineligible' } });
+  if (!entries.length) { const error = new Error('There are no eligible paid entries to settle.'); error.status = 409; throw error; }
+  const failed = entries.filter((entry) => entry.scoreSyncStatus === 'failed');
+  if (failed.length) { const error = new Error(`${failed.length} eligible entr${failed.length === 1 ? 'y' : 'ies'} could not be scored from FPL.`); error.status = 409; throw error; }
+  entries.sort((a, b) => Number(b.currentScore || 0) - Number(a.currentScore || 0) || new Date(a.joinedAt || 0) - new Date(b.joinedAt || 0));
+  let lastScore = null; let rank = 0;
+  entries.forEach((entry, index) => { if (lastScore === null || Number(entry.currentScore) !== Number(lastScore)) rank = index + 1; entry.currentRank = rank; lastScore = entry.currentScore; });
+  const topScore = Number(entries[0].currentScore || 0);
+  const winners = entries.filter((entry) => Number(entry.currentScore || 0) === topScore);
+  const totalPrize = Math.max(0, Number(league.displayedPrizeCents || league.projectedPrizeCents || Math.max(0, Number(league.grossPoolCents || 0))));
+  const base = winners.length ? Math.floor(totalPrize / winners.length) : 0;
+  let remainder = totalPrize - base * winners.length;
+  const winnerIds = new Set(winners.map((entry) => String(entry.userId)));
+  for (const entry of entries) {
+    if (winnerIds.has(String(entry.userId))) {
+      const amount = base + (remainder > 0 ? 1 : 0); if (remainder > 0) remainder -= 1;
+      entry.prizeCents = amount; entry.payoutStatus = 'paid';
+      if (amount > 0) {
+        const reference = `ADMIN-PRIZE-${league._id}-${entry.userId}`;
+        await Transaction.findOneAndUpdate({ reference }, { $setOnInsert: { userId: entry.userId, leagueId: league._id, reference, type: 'prize', direction: 'credit', amountCents: amount, currency: 'USD', provider: 'admin-settlement', status: 'completed', description: `Prize for ${league.name}`, metadata: { purpose: 'manual-league-settlement', reason: String(reason || ''), adminUserId: String(adminUserId || '') } } }, { upsert: true, new: true });
+        await updateWalletBalances(entry.userId, { availableBalanceCents: amount, lifetimePrizesCents: amount }, `Manual league settlement ${reference}`, 'settleStandardLeagueFromAdmin', {}, `${reference}:wallet-credit`);
+      }
+    } else {
+      entry.prizeCents = 0; entry.payoutStatus = 'not-applicable';
+    }
+    await entry.save();
+  }
+  const now = new Date();
+  league.status = 'settled'; league.completedAt = league.fplFinishedAt || now; league.expiresAt = league.fplFinishedAt || now; league.fplFinishedAt = league.fplFinishedAt || now;
+  if (verified.dataChecked) league.fplDataCheckedAt = league.fplDataCheckedAt || now;
+  await league.save();
+  await emailService.notifyLeagueOutcomes(league._id);
+  return { settled: true, winners: winners.length, prizeCents: totalPrize, manual: true };
+}
+
 app.get('/api/admin/leagues', requireAdmin, async (req, res, next) => {
   try {
     const { page, limit } = pageOptions(req); const search = String(req.query.search || '').trim();
@@ -5069,47 +5316,76 @@ app.get('/api/admin/leagues', requireAdmin, async (req, res, next) => {
   } catch(error){next(error);}
 });
 
-app.get('/api/admin/leagues/:id', requireAdmin, async (req,res,next)=>{try{
-  const league=await League.findById(req.params.id).populate('createdBy','fullName email').lean(); if(!league)return failure(res,404,'League not found.');
-  const members=await LeagueEntry.find({leagueId:league._id}).populate('userId','fullName email phone status fantasyTeamName').sort({currentRank:1,joinedAt:1}).lean();
-  return success(res,{league,members,leaderboard:members.map(m=>({entryId:m._id,user:m.userId,rank:m.currentRank,score:m.currentScore,prizeCents:m.prizeCents,joinedAt:m.joinedAt,eligibilityStatus:m.eligibilityStatus}))});
-}catch(error){next(error);}});
+app.get('/api/admin/leagues/:id', requireAdmin, async (req, res, next) => {
+  try {
+    const refreshRequested = String(req.query.refresh || '') === '1';
+    const base = await League.findById(req.params.id).lean();
+    if (!base) return failure(res, 404, 'League not found.');
+    if (refreshRequested) {
+      await refreshLeagueLifecycleIfStale();
+      if (base.officialSupremeLeague) {
+        await localGrowth.settleLeagueById(base._id, { trigger: 'admin-league-page' }).catch((error) => {
+          if (Number(error.status || 500) >= 500) console.error('Admin opportunistic Supreme settlement failed:', error.message);
+        });
+      }
+      await syncLeagueScores(base._id, { force: false }).catch((error) => console.warn('Admin league score refresh failed:', error.message));
+    }
+    const [league, members, settlement] = await Promise.all([
+      League.findById(req.params.id).populate('createdBy', 'fullName email').lean(),
+      LeagueEntry.find({ leagueId: req.params.id }).populate('userId', 'fullName email phone status fantasyTeamName').sort({ currentRank: 1, joinedAt: 1 }).lean(),
+      getLeagueSettlementDiagnostics(req.params.id, { verifyLive: refreshRequested }),
+    ]);
+    return success(res, { league, members, settlement, leaderboard: members.map((m) => ({ entryId: m._id, user: m.userId, rank: m.currentRank, score: m.currentScore, scoreDetails: m.scoreDetails || {}, prizeCents: m.prizeCents, payoutStatus: m.payoutStatus, joinedAt: m.joinedAt, eligibilityStatus: m.eligibilityStatus })) });
+  } catch (error) { next(error); }
+});
 
 app.patch('/api/admin/leagues/:id/status', requireAdmin, writeLimiter, async (req, res, next) => {
   try {
-    const allowed = ['draft', 'open', 'full', 'upcoming', 'live', 'awaiting-review', 'settled', 'cancelled'];
+    const allowed = ['draft', 'open', 'full', 'upcoming', 'live', 'awaiting-review', 'cancelled'];
+    if (req.body.status === 'settled') return failure(res, 409, 'Use the settlement controls to settle a league. Settlement must calculate scores and credit prizes; a status change alone is not settlement.');
     if (!allowed.includes(req.body.status)) return failure(res, 400, 'Invalid league status.');
-    const before = await League.findById(req.params.id).lean();
-    if (!before) return failure(res, 404, 'League not found.');
-
-    let settlementLifecycleFields = {};
-    if (req.body.status === 'settled' && FPL_DATA_MODE === 'public') {
-      const bootstrap = await publicFantasyProvider.getBootstrap();
-      const endEvent = fplEventFromBootstrap(bootstrap, before.endGameweek);
-      if (!endEvent) return failure(res, 409, `FPL Gameweek ${before.endGameweek} is not available, so this league cannot be settled yet.`);
-      if (endEvent.finished !== true) return failure(res, 409, `FPL has not marked Gameweek ${before.endGameweek} as finished yet.`);
-      if (endEvent.data_checked !== true) return failure(res, 409, `FPL has finished Gameweek ${before.endGameweek}, but its scoring data has not been checked yet.`);
-      const observedFinishedAt = before.fplFinishedAt || new Date();
-      settlementLifecycleFields = {
-        completedAt: observedFinishedAt,
-        expiresAt: observedFinishedAt,
-        fplFinishedAt: observedFinishedAt,
-        fplDataCheckedAt: before.fplDataCheckedAt || new Date(),
-      };
-    } else if (req.body.status === 'settled') {
-      settlementLifecycleFields = { completedAt: new Date() };
-    }
-
-    const league = await League.findByIdAndUpdate(
-      req.params.id,
-      { $set: { status: req.body.status, ...settlementLifecycleFields } },
-      { new: true }
-    );
+    const league = await League.findByIdAndUpdate(req.params.id, { $set: { status: req.body.status } }, { new: true });
+    if (!league) return failure(res, 404, 'League not found.');
     await adminAudit(req, 'league.status.updated', 'League', league._id, { status: req.body.status });
-    if (before.status !== 'settled' && league.status === 'settled') {
-      await emailService.notifyLeagueOutcomes(league._id);
-    }
     return success(res, { league });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/admin/leagues/:id/refresh-scores', requireAdmin, writeLimiter, async (req, res, next) => {
+  try {
+    const league = await League.findById(req.params.id);
+    if (!league) return failure(res, 404, 'League not found.');
+    await refreshLeagueLifecycleIfStale();
+    const synced = await syncLeagueScores(league._id, { force: true });
+    return success(res, { synced, settlement: await getLeagueSettlementDiagnostics(league._id) });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/admin/leagues/:id/settlement/retry', requireAdmin, writeLimiter, async (req, res, next) => {
+  try {
+    const league = await League.findById(req.params.id);
+    if (!league) return failure(res, 404, 'League not found.');
+    let result;
+    if (league.officialSupremeLeague) result = await localGrowth.settleLeagueById(league._id, { manualBy: req.user._id, reason: 'Administrator requested automatic settlement retry' });
+    else result = await settleStandardLeagueFromAdmin(league._id, { adminUserId: req.user._id, reason: 'Administrator requested automatic settlement retry', forceDataChecked: false });
+    await adminAudit(req, 'league.settlement.retry', 'League', league._id, { result });
+    return success(res, { result, settlement: await getLeagueSettlementDiagnostics(league._id) });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/admin/leagues/:id/settlement/manual', requireAdmin, writeLimiter, async (req, res, next) => {
+  try {
+    const reason = String(req.body.reason || '').trim().slice(0, 500);
+    if (!reason) return failure(res, 400, 'Provide a reason for the manual settlement override.');
+    const league = await League.findById(req.params.id);
+    if (!league) return failure(res, 404, 'League not found.');
+    // Manual override can bypass data_checked after an administrator reviews the
+    // leaderboard, but it can NEVER bypass the verified football-finished check.
+    const result = league.officialSupremeLeague
+      ? await localGrowth.settleLeagueById(league._id, { manualBy: req.user._id, reason, forceDataChecked: true })
+      : await settleStandardLeagueFromAdmin(league._id, { adminUserId: req.user._id, reason, forceDataChecked: true });
+    await adminAudit(req, 'league.settlement.manual', 'League', league._id, { reason, result });
+    return success(res, { result, settlement: await getLeagueSettlementDiagnostics(league._id) });
   } catch (error) { next(error); }
 });
 
@@ -5143,7 +5419,31 @@ app.get('/api/admin/users', requireAdmin, async(req,res,next)=>{try{
   const sm=new Map(subs.map(x=>[String(x.userId),x])); const em=new Map(entries.map(x=>[String(x._id),x.count])); const wm=new Map(wallets.map(x=>[String(x.userId),x])); return success(res,{rows:rows.map(u=>({...adminPublicUser(u),subscription:sm.get(String(u._id))||null,leagueCount:em.get(String(u._id))||0,wallet:wm.get(String(u._id))||null})),pagination:{page,limit,total,pages:Math.ceil(total/limit)}});
 }catch(error){next(error);}});
 
-app.get('/api/admin/users/:id', requireAdmin, async(req,res,next)=>{try{const [user,profile,wallet,subscriptions,entries,transactions]=await Promise.all([User.findById(req.params.id).lean(),UserProfile.findOne({userId:req.params.id}).lean(),Wallet.findOne({userId:req.params.id}).lean(),Subscription.find({userId:req.params.id}).sort({createdAt:-1}).lean(),LeagueEntry.find({userId:req.params.id}).populate('leagueId','name competitionType status').sort({joinedAt:-1}).lean(),Transaction.find({userId:req.params.id}).sort({createdAt:-1}).limit(200).lean()]); if(!user)return failure(res,404,'User not found.'); return success(res,{user,profile,wallet,subscriptions,entries,transactions});}catch(error){next(error);}});
+app.get('/api/admin/users/:id', requireAdmin, async (req, res, next) => {
+  try {
+    const refreshRequested = String(req.query.refresh || '') === '1';
+    const userDoc = await User.findById(req.params.id);
+    if (!userDoc) return failure(res, 404, 'User not found.');
+    let team = null;
+    if (userDoc.fplManagerId) {
+      if (refreshRequested) {
+        await Promise.allSettled([
+          persistFantasyTeamSnapshot(userDoc, { force: false }),
+          syncUserLeagueScores(userDoc._id, { force: false, limit: 8 }),
+        ]);
+      }
+      team = await buildTeamPayload(userDoc, { refresh: false }).catch((error) => ({ error: error.message, providerMode: FPL_DATA_MODE }));
+    }
+    const [user, profile, wallet, subscriptions, entries, transactions] = await Promise.all([
+      User.findById(req.params.id).lean(), UserProfile.findOne({ userId: req.params.id }).lean(), Wallet.findOne({ userId: req.params.id }).lean(),
+      Subscription.find({ userId: req.params.id }).sort({ createdAt: -1 }).lean(),
+      LeagueEntry.find({ userId: req.params.id }).populate('leagueId', 'name competitionType status').sort({ joinedAt: -1 }).lean(),
+      Transaction.find({ userId: req.params.id }).sort({ createdAt: -1 }).limit(200).lean(),
+    ]);
+    return success(res, { user, profile, wallet, subscriptions, entries, transactions, team });
+  } catch (error) { next(error); }
+});
+
 app.patch('/api/admin/users/:id/status', requireAdmin, writeLimiter, async(req,res,next)=>{try{if(!['active','suspended','closed'].includes(req.body.status))return failure(res,400,'Invalid user status.'); const user=await User.findOneAndUpdate({_id:req.params.id,role:'user'},{$set:{status:req.body.status}},{new:true}); if(!user)return failure(res,404,'User not found.'); await adminAudit(req,'user.status.updated','User',user._id,{status:req.body.status}); return success(res,{user:adminPublicUser(user)});}catch(error){next(error);}});
 
 // Cancels a subscription that was created too late for the cycle it targeted
@@ -5219,9 +5519,32 @@ app.post('/api/admin/subscriptions/:id/cancel-refund', requireAdmin, writeLimite
   } catch (error) { next(error); }
 });
 
-// Ad-hoc wallet credit used, for example, to compensate members who upgraded
-// or replaced a subscription/league entry for the price difference. Creates a
-// completed 'adjustment' transaction, credits the wallet, and emails the member.
+// Admin-awarded performance bonus. The amount is credited to the member's
+// available/withdrawable wallet balance, recorded as an auditable adjustment,
+// and the member receives an email with the amount and reason.
+app.post('/api/admin/users/:id/performance-bonus', requireAdmin, writeLimiter, async (req, res, next) => {
+  try {
+    const user = await User.findOne({ _id: req.params.id, role: 'user' });
+    if (!user) return failure(res, 404, 'User not found.');
+    const reason = String(req.body.reason || '').trim().slice(0, 500);
+    if (!reason) return failure(res, 400, 'Provide the performance achievement or reason for this bonus.');
+    const amountCents = Math.round(Number(req.body.amountCents));
+    if (!Number.isFinite(amountCents) || amountCents <= 0) return failure(res, 400, 'Provide a bonus amount greater than $0.00.');
+    await ensureUserResources(user._id);
+    const reference = createReference('BONUS');
+    const transaction = await Transaction.create({
+      userId: user._id, reference, type: 'adjustment', direction: 'credit', amountCents, currency: 'USD', provider: 'admin-performance-bonus', status: 'completed',
+      description: `Performance bonus — ${reason}`,
+      metadata: { purpose: 'performance-bonus', reason, adminId: String(req.user._id) },
+    });
+    await updateWalletBalances(user._id, { availableBalanceCents: amountCents, lifetimeAdjustmentsCents: amountCents }, `Performance bonus ${reference}`, 'adminPerformanceBonus', {}, `${reference}:wallet-credit`);
+    await emailService.notifyPerformanceBonus(transaction);
+    await adminAudit(req, 'performance-bonus.awarded', 'User', user._id, { amountCents, reason, reference });
+    const wallet = await Wallet.findOne({ userId: user._id }).lean();
+    return success(res, { wallet, transaction }, 201);
+  } catch (error) { next(error); }
+});
+
 app.post('/api/admin/users/:id/wallet/credit', requireAdmin, writeLimiter, async (req, res, next) => {
   try {
     const user = await User.findById(req.params.id);
@@ -5697,7 +6020,9 @@ const localGrowth = (() => {
       const SupremeLeagueMeta = mongoose.models.SupremeLeagueMeta || mongoose.model('SupremeLeagueMeta', new Schema({
         leagueId: { type: Schema.Types.ObjectId, ref: 'League', required: true, unique: true, index: true },
         cycleKey: { type: String, required: true, unique: true, index: true },
-        cadence: { type: String, enum: ['weekly', 'bi-weekly', 'monthly', 'half-season', 'season'], required: true, index: true },
+        cadence: { type: String, enum: ['weekly', 'bi-weekly', 'monthly', 'half-season', 'season', 'clash-captains'], required: true, index: true },
+        scoringMode: { type: String, enum: ['manager-points', 'captain-vice'], default: 'manager-points', index: true },
+        entryMode: { type: String, enum: ['subscription', 'weekly-flex', 'free-all'], default: 'subscription', index: true },
         periodLabel: { type: String, required: true },
         startGameweek: { type: Number, required: true },
         endGameweek: { type: Number, required: true },
@@ -5714,6 +6039,10 @@ const localGrowth = (() => {
         winnerUserIds: [{ type: Schema.Types.ObjectId, ref: 'User' }],
         splitAmountCents: { type: Number, default: 0 },
         lastMaintenanceAt: { type: Date, default: null },
+        lastSettlementAttemptAt: { type: Date, default: null },
+        manualSettlementAt: { type: Date, default: null },
+        manualSettlementBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+        manualSettlementReason: { type: String, default: '' },
         lastError: { type: String, default: '' },
       }, { timestamps: true }));
     
@@ -6035,13 +6364,104 @@ const localGrowth = (() => {
         return { checked: subscriptions.length, sent, skipped };
       }
 
+      async function sendLeagueJoinDeadlineReminders(now = new Date()) {
+        if (FPL_DATA_MODE !== 'public') return { skipped: true, reason: 'fpl-data-mode-not-public', checked: 0, sent: 0 };
+        const upper = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+        const metas = await SupremeLeagueMeta.find({
+          settlementStatus: 'open',
+          joinDeadlineAt: { $gt: now, $lte: upper },
+        }).sort({ joinDeadlineAt: 1 }).lean();
+        if (!metas.length) return { checked: 0, sent: 0, deadlines: 0 };
+
+        const leagueIds = metas.map((meta) => meta.leagueId);
+        const [leagues, entries, users] = await Promise.all([
+          League.find({ _id: { $in: leagueIds } }).select('_id name status entryFeeCents').lean(),
+          LeagueEntry.find({ leagueId: { $in: leagueIds }, paymentStatus: { $in: ['paid', 'completed'] } }).select('leagueId userId').lean(),
+          User.find({ role: 'user', status: 'active', email: { $exists: true, $ne: '' } }).select('_id fullName email fplManagerId').lean(),
+        ]);
+        const leagueMap = new Map(leagues.map((league) => [String(league._id), league]));
+        const joined = new Set(entries.map((entry) => `${entry.userId}:${entry.leagueId}`));
+        const subscriptions = await activeSubscriptionsForUsers(users.map((user) => user._id), now);
+        const subscriptionsByUser = new Map();
+        for (const sub of subscriptions) {
+          const key = String(sub.userId);
+          if (!subscriptionsByUser.has(key)) subscriptionsByUser.set(key, []);
+          subscriptionsByUser.get(key).push(sub);
+        }
+
+        const deadlineGroups = new Map();
+        for (const meta of metas) {
+          const key = new Date(meta.joinDeadlineAt).toISOString();
+          if (!deadlineGroups.has(key)) deadlineGroups.set(key, []);
+          deadlineGroups.get(key).push(meta);
+        }
+
+        let checked = 0;
+        let sent = 0;
+        let skipped = 0;
+        for (const [deadlineIso, group] of deadlineGroups) {
+          const deadline = new Date(deadlineIso);
+          const hoursLeft = Math.max(0, (deadline.getTime() - now.getTime()) / 3600000);
+          const reminderBucket = hoursLeft <= 24 ? 24 : 48;
+          const formattedDeadline = deadline.toLocaleString('en-GB', {
+            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'UTC', timeZoneName: 'short',
+          });
+
+          for (const user of users) {
+            checked += 1;
+            if (!(await userEmailNotificationsAllowed(user._id, 'deadlineReminders'))) {
+              skipped += 1;
+              continue;
+            }
+            const subs = subscriptionsByUser.get(String(user._id)) || [];
+            const eligible = group.filter((meta) => {
+              if (joined.has(`${user._id}:${meta.leagueId}`)) return false;
+              if (meta.entryMode === 'free-all') return Boolean(String(user.fplManagerId || '').trim());
+              if (meta.entryMode === 'weekly-flex') return true;
+              return subs.some((sub) => subscriptionEntitles(sub, meta.cadence, meta));
+            });
+            if (!eligible.length) continue;
+
+            const rows = eligible.map((meta) => {
+              const league = leagueMap.get(String(meta.leagueId));
+              const access = meta.entryMode === 'weekly-flex'
+                ? `${money(Number(league?.entryFeeCents ?? meta.entryFeeCents ?? 100))} one-off or eligible subscription`
+                : meta.entryMode === 'free-all' ? 'Free entry' : 'Included with eligible subscription';
+              return { label: league?.name || meta.periodLabel, value: access };
+            });
+            rows.push({ label: 'Entry deadline', value: formattedDeadline });
+
+            const upcomingClash = eligible.some((meta) => meta.cadence === 'clash-captains') || group.some((meta) => meta.cadence === 'clash-captains');
+            const result = await sendEmail({
+              eventKey: `league-join-deadline:${deadlineIso}:${reminderBucket}:${user._id}`,
+              userId: user._id,
+              to: user.email,
+              category: 'league-reminder',
+              subject: `${reminderBucket} hours or less to enter your upcoming Supreme competitions`,
+              preheader: `Entries close at the official FPL deadline. Your eligible competitions are ready now.`,
+              title: `${reminderBucket} hours or less before entries close`,
+              tone: reminderBucket === 24 ? 'danger' : 'brand',
+              message: `<p style="margin:0 0 14px;">Hi ${htmlEscape(user.fullName || 'there')}, your eligible Supreme competitions are already open. Join before the official FPL deadline below.</p><p style="margin:0 0 14px;">The weekly league can be entered with an eligible subscription or as a ${money(cents(process.env.SUPREME_WEEKLY_ENTRY_FEE_CENTS, 100))} one-off entry for a ${money(cents(process.env.SUPREME_WEEKLY_PRIZE_CENTS, 1000))} guaranteed prize.</p>${upcomingClash ? `<p style="margin:0;"><strong>September special:</strong> Clash of the Captains is free for linked users. Your captain's raw FPL points plus your vice-captain's raw FPL points determine the leaderboard, with ${money(cents(process.env.SUPREME_CLASH_CAPTAINS_PRIZE_CENTS, 300))} for first place.</p>` : ''}`,
+              buttonLabel: 'View open competitions',
+              buttonUrl: `${appUrl}/app/leagues/supreme`,
+              details: rows.slice(0, 8),
+              metadata: { deadline: deadlineIso, reminderBucket, leagueIds: eligible.map((meta) => String(meta.leagueId)), clashPromoted: upcomingClash },
+            });
+            if (result?.skipped || result?.error) skipped += 1; else sent += 1;
+          }
+        }
+        return { checked, sent, skipped, deadlines: deadlineGroups.size };
+      }
+
       async function sendScheduledUserEmails(now = new Date()) {
         const result = {
           accountSetup: { checked: 0, sent: 0, skipped: 0 },
+          leagueDeadlines: { checked: 0, sent: 0, skipped: 0 },
           gameweek: { checked: 0, sent: 0, skipped: 0 },
           subscriptionLapse: { checked: 0, sent: 0, skipped: 0 },
         };
         result.accountSetup = await sendAccountSetupReminders(now);
+        result.leagueDeadlines = await sendLeagueJoinDeadlineReminders(now);
         result.gameweek = await sendGameweekDeadlineReminders(now);
         result.subscriptionLapse = await sendSubscriptionLapseReminders(now);
         return result;
@@ -6335,89 +6755,122 @@ const localGrowth = (() => {
       }
     
       function supremeDefinitions(bootstrap) {
-        const events = Array.isArray(bootstrap.events) ? bootstrap.events : [];
+        const events = Array.isArray(bootstrap?.events) ? bootstrap.events : [];
         if (!events.length) return [];
 
+        const now = new Date();
+        const horizon = new Date(now.getTime() + SUPREME_PLANNING_HORIZON_DAYS * 86400000);
         const season = seasonKey(events);
-        const eventById = (id) => events.find((event) => Number(event.id) === Number(id));
-        const anchors = [
-          events.find((event) => event.is_current),
-          events.find((event) => event.is_next),
-        ].filter(Boolean);
-        if (!anchors.length) {
-          const firstUnfinished = events.find((event) => event.finished !== true) || events[events.length - 1];
-          if (firstUnfinished) anchors.push(firstUnfinished);
-        }
-
+        const eventById = new Map(events.map((event) => [Number(event.id), event]));
         const definitions = new Map();
-        const add = (cadence, keySuffix, label, startGameweek, endGameweek, prizeCents, entryFeeCents = 0) => {
-          const first = eventById(startGameweek);
-          const last = eventById(endGameweek);
+        const isFutureJoinableEvent = (event) => {
+          if (!event?.deadline_time) return false;
+          const deadline = new Date(event.deadline_time);
+          return !Number.isNaN(deadline.getTime()) && deadline > now && deadline <= horizon;
+        };
+        const add = ({ cadence, keySuffix, label, startGameweek, endGameweek, prizeCents, entryFeeCents = 0, scoringMode = 'manager-points', entryMode = 'subscription' }) => {
+          const first = eventById.get(Number(startGameweek));
+          const last = eventById.get(Number(endGameweek));
           if (!first?.deadline_time || !last) return;
+          const joinDeadlineAt = new Date(first.deadline_time);
+          if (Number.isNaN(joinDeadlineAt.getTime()) || joinDeadlineAt <= now || joinDeadlineAt > horizon) return;
           const cycleKey = `${season}:${cadence}:${keySuffix}`;
           definitions.set(cycleKey, {
             cadence,
             cycleKey,
             periodLabel: label,
-            startGameweek,
-            endGameweek,
-            joinDeadlineAt: new Date(first.deadline_time),
+            startGameweek: Number(startGameweek),
+            endGameweek: Number(endGameweek),
+            joinDeadlineAt,
             prizeCents,
             entryFeeCents,
+            scoringMode,
+            entryMode,
           });
         };
 
-        for (const anchor of anchors) {
-          const gw = Number(anchor.id);
-          add(
-            'weekly',
-            `gw${gw}`,
-            `Gameweek ${gw}`,
-            gw,
-            gw,
-            cents(process.env.SUPREME_WEEKLY_PRIZE_CENTS, 1000),
-            cents(process.env.SUPREME_WEEKLY_ENTRY_FEE_CENTS, 100)
-          );
-
-          const biStart = Math.floor((gw - 1) / 2) * 2 + 1;
-          add(
-            'bi-weekly',
-            `gw${biStart}-${Math.min(biStart + 1, 38)}`,
-            `Gameweeks ${biStart}-${Math.min(biStart + 1, 38)}`,
-            biStart,
-            Math.min(biStart + 1, 38),
-            cents(process.env.SUPREME_BIWEEKLY_PRIZE_CENTS, 1500)
-          );
-
-          const anchorDeadline = new Date(anchor.deadline_time);
-          const monthlyEvents = events.filter((event) => {
-            const date = new Date(event.deadline_time);
-            return date.getUTCFullYear() === anchorDeadline.getUTCFullYear() && date.getUTCMonth() === anchorDeadline.getUTCMonth();
+        const planningEvents = events.filter(isFutureJoinableEvent).sort((a, b) => Number(a.id) - Number(b.id));
+        for (const event of planningEvents) {
+          const gw = Number(event.id);
+          add({
+            cadence: 'weekly', keySuffix: `gw${gw}`, label: `Gameweek ${gw}`, startGameweek: gw, endGameweek: gw,
+            prizeCents: cents(process.env.SUPREME_WEEKLY_PRIZE_CENTS, 1000),
+            entryFeeCents: cents(process.env.SUPREME_WEEKLY_ENTRY_FEE_CENTS, 100),
+            entryMode: 'weekly-flex',
           });
-          if (monthlyEvents.length) {
-            add(
-              'monthly',
-              `${anchorDeadline.getUTCFullYear()}-${String(anchorDeadline.getUTCMonth() + 1).padStart(2, '0')}`,
-              anchorDeadline.toLocaleString('en-GB', { month: 'long', year: 'numeric', timeZone: 'UTC' }),
-              Number(monthlyEvents[0].id),
-              Number(monthlyEvents[monthlyEvents.length - 1].id),
-              cents(process.env.SUPREME_MONTHLY_PRIZE_CENTS, 3000)
-            );
-          }
-
-          const halfStart = gw <= 19 ? 1 : 20;
-          add(
-            'half-season',
-            `half${gw <= 19 ? 1 : 2}`,
-            `Half ${gw <= 19 ? 1 : 2}`,
-            halfStart,
-            gw <= 19 ? 19 : 38,
-            cents(process.env.SUPREME_HALF_SEASON_PRIZE_CENTS, 10000)
-          );
-          add('season', 'full-season', `${season} season`, 1, 38, cents(process.env.SUPREME_SEASON_PRIZE_CENTS, 30000));
         }
 
-        return Array.from(definitions.values());
+        // Bi-weekly competitions are built from the real FPL gameweek sequence. The
+        // first FPL deadline is always the entry deadline; no calendar arithmetic is used.
+        for (let gw = 1; gw <= 38; gw += 2) {
+          const first = eventById.get(gw);
+          const second = eventById.get(Math.min(gw + 1, 38));
+          if (!first || !second || !isFutureJoinableEvent(first)) continue;
+          add({
+            cadence: 'bi-weekly', keySuffix: `gw${gw}-${Math.min(gw + 1, 38)}`,
+            label: `Gameweeks ${gw}-${Math.min(gw + 1, 38)}`,
+            startGameweek: gw, endGameweek: Math.min(gw + 1, 38),
+            prizeCents: cents(process.env.SUPREME_BIWEEKLY_PRIZE_CENTS, 1500),
+          });
+        }
+
+        // FPL itself publishes named monthly phases (for example September). Use
+        // those phase boundaries instead of guessing where a month starts/ends.
+        const phases = Array.isArray(bootstrap?.phases) ? bootstrap.phases : [];
+        for (const phase of phases) {
+          const phaseName = String(phase?.name || '').trim();
+          const startGameweek = Number(phase?.start_event || 0);
+          const endGameweek = Number(phase?.stop_event || 0);
+          if (!phaseName || !startGameweek || !endGameweek || /overall/i.test(phaseName)) continue;
+          const startEvent = eventById.get(startGameweek);
+          if (!startEvent || !isFutureJoinableEvent(startEvent)) continue;
+          const startDeadline = new Date(startEvent.deadline_time);
+          const cycleSuffix = `${startDeadline.getUTCFullYear()}-${String(startDeadline.getUTCMonth() + 1).padStart(2, '0')}`;
+          add({
+            cadence: 'monthly', keySuffix: cycleSuffix,
+            label: `${phaseName} ${startDeadline.getUTCFullYear()}`,
+            startGameweek, endGameweek,
+            prizeCents: cents(process.env.SUPREME_MONTHLY_PRIZE_CENTS, 3000),
+          });
+        }
+
+        const firstPlanning = planningEvents[0];
+        if (firstPlanning) {
+          const gw = Number(firstPlanning.id);
+          const halfStart = gw <= 19 ? 1 : 20;
+          add({
+            cadence: 'half-season', keySuffix: `half${gw <= 19 ? 1 : 2}`,
+            label: `Half ${gw <= 19 ? 1 : 2}`, startGameweek: halfStart, endGameweek: gw <= 19 ? 19 : 38,
+            prizeCents: cents(process.env.SUPREME_HALF_SEASON_PRIZE_CENTS, 10000),
+          });
+          add({
+            cadence: 'season', keySuffix: 'full-season', label: `${season} season`, startGameweek: 1, endGameweek: 38,
+            prizeCents: cents(process.env.SUPREME_SEASON_PRIZE_CENTS, 30000),
+          });
+        }
+
+        // Clash of the Captains only exists for the FPL-published September phase.
+        // Every linked active user is eligible for free; score = captain raw GW points
+        // + vice-captain raw GW points. Chips/multipliers do not alter this contest score.
+        const september = phases.find((phase) => String(phase?.name || '').trim().toLowerCase() === 'september');
+        if (september) {
+          const start = Number(september.start_event || 0);
+          const stop = Number(september.stop_event || 0);
+          for (let gw = start; gw <= stop; gw += 1) {
+            const event = eventById.get(gw);
+            if (!event || !isFutureJoinableEvent(event)) continue;
+            add({
+              cadence: 'clash-captains', keySuffix: `gw${gw}`, label: `Gameweek ${gw}`,
+              startGameweek: gw, endGameweek: gw,
+              prizeCents: cents(process.env.SUPREME_CLASH_CAPTAINS_PRIZE_CENTS, 300),
+              entryFeeCents: 0,
+              scoringMode: 'captain-vice',
+              entryMode: 'free-all',
+            });
+          }
+        }
+
+        return Array.from(definitions.values()).sort((a, b) => a.joinDeadlineAt - b.joinDeadlineAt || a.startGameweek - b.startGameweek);
       }
 
       async function resolveSystemCreator() {
@@ -6428,7 +6881,74 @@ const localGrowth = (() => {
         }
         return User.findOne({ role: 'admin' }).sort({ createdAt: 1 });
       }
-    
+
+      function definitionCopy(def) {
+        return {
+          cadence: def.cadence,
+          scoringMode: def.scoringMode || 'manager-points',
+          entryMode: def.entryMode || 'subscription',
+          periodLabel: def.periodLabel,
+          startGameweek: def.startGameweek,
+          endGameweek: def.endGameweek,
+          joinDeadlineAt: def.joinDeadlineAt,
+          prizeCents: def.prizeCents,
+          entryFeeCents: def.entryFeeCents,
+        };
+      }
+
+      function supremeCopyForDefinition(def) {
+        const isWeekly = def.entryMode === 'weekly-flex';
+        const isClash = def.entryMode === 'free-all' && def.scoringMode === 'captain-vice';
+        if (isClash) {
+          return {
+            name: `Clash of the Captains — ${def.periodLabel}`,
+            description: `Free September competition for every linked Supreme Fantasy League player. Your Clash score is your selected FPL captain's raw gameweek points plus your vice-captain's raw gameweek points. Highest score wins ${money(def.prizeCents)}.`,
+            competitionType: 'clash-captains',
+            ruleType: 'captain-vice-score',
+            rules: [
+              'Entry is free for every active Supreme Fantasy League user with a linked FPL manager before the official gameweek deadline.',
+              'The competition is created only for gameweeks in FPL’s own September phase.',
+              'Clash score equals the raw FPL points of the selected captain plus the raw FPL points of the selected vice-captain.',
+              'Captain multipliers, Triple Captain multipliers and Bench Boost do not multiply the Clash score.',
+              'Entry closes at the official FPL gameweek deadline.',
+              'The competition closes only when FPL marks the gameweek finished and every fixture is finished.',
+              'Prizes are paid after FPL marks the gameweek data_checked.',
+              'If first place is tied, the published prize is split fairly among all tied winners.',
+            ],
+          };
+        }
+        if (isWeekly) {
+          return {
+            name: `Supreme weekly — ${def.periodLabel}`,
+            description: `Official weekly Supreme competition for ${def.periodLabel}. Join with an eligible subscription or pay ${money(def.entryFeeCents)} for this gameweek. The guaranteed prize is ${money(def.prizeCents)}.`,
+            competitionType: 'weekly',
+            ruleType: 'weekly-entry',
+            rules: [
+              `Join with an eligible subscription or pay ${money(def.entryFeeCents)} for this weekly competition.`,
+              'New entries close at the official FPL deadline for this gameweek.',
+              'The competition closes only when FPL marks the gameweek finished and every fixture is finished.',
+              'Prizes are paid after FPL marks the gameweek data_checked.',
+              'Standings use qualifying FPL gameweek points.',
+              'If first place is tied, the published prize is split fairly among all tied winners.',
+            ],
+          };
+        }
+        return {
+          name: `Supreme ${def.cadence.replace('-', ' ')} — ${def.periodLabel}`,
+          description: `Automatic Supreme Fantasy League competition for ${def.periodLabel}. Entry is included when the user's active subscription plan covers this competition.`,
+          competitionType: def.cadence === 'bi-weekly' ? 'best-of-three' : def.cadence,
+          ruleType: 'subscription',
+          rules: [
+            'Users with an eligible active subscription are automatically entered.',
+            'New entries close at the official FPL deadline for the first gameweek in this competition.',
+            'The competition closes only after FPL marks every included gameweek finished and every fixture is finished.',
+            'Prizes are paid only after FPL marks every included gameweek data_checked.',
+            'Standings use qualifying FPL gameweek points recorded across the competition range.',
+            'If first place is tied, the published prize is split fairly among all tied winners.',
+          ],
+        };
+      }
+
       async function ensureSupremeLeagues() {
         const [bootstrap, creator] = await Promise.all([fetchFplBootstrap(), resolveSystemCreator()]);
         if (!creator) throw new Error('Create an administrator or set SUPREME_SYSTEM_USER_EMAIL before Supreme leagues can be generated.');
@@ -6437,6 +6957,7 @@ const localGrowth = (() => {
         let reconciled = 0;
 
         for (const def of definitions) {
+          const copy = supremeCopyForDefinition(def);
           let schedule = null;
           try {
             schedule = await getFplGameweekSchedule(def.endGameweek, { bootstrap, includeFixtures: true });
@@ -6446,52 +6967,36 @@ const localGrowth = (() => {
           const lifecycleFields = {
             lastFixtureKickoffAt: schedule?.lastFixtureKickoffAt || null,
             finishedAt: schedule?.finished ? new Date() : null,
-            dataCheckedAt: schedule?.dataChecked ? new Date() : null,
+            dataCheckedAt: schedule?.finished && schedule?.dataChecked ? new Date() : null,
           };
-
-          const isWeeklyPaidEntry = def.cadence === 'weekly' && def.entryFeeCents > 0;
-          const weeklyDescription = `Official weekly Supreme competition for ${def.periodLabel}. Entry is ${money(def.entryFeeCents)} unless it is already included by an eligible subscription. The guaranteed prize is ${money(def.prizeCents)}.`;
-          const standardDescription = `Automatic Supreme Fantasy League competition for ${def.periodLabel}. Entry is determined by the user's active subscription plan. In a draw, the published prize is split fairly among all tied winners.`;
 
           const existing = await SupremeLeagueMeta.findOne({ cycleKey: def.cycleKey });
           if (existing) {
             const league = await League.findById(existing.leagueId);
             if (league) {
               league.entryFeeCents = def.entryFeeCents;
-              league.description = isWeeklyPaidEntry ? weeklyDescription : standardDescription;
-              league.ruleType = isWeeklyPaidEntry ? 'weekly-entry' : 'subscription';
-              league.rules = [
-                ...(isWeeklyPaidEntry
-                  ? [`Weekly entry costs ${money(def.entryFeeCents)} unless an eligible subscription already includes the competition.`]
-                  : ['Only users with an eligible active subscription are automatically entered.']),
-                'New entries close at the official FPL deadline for the first gameweek in this competition.',
-                'The competition remains live until FPL marks the final gameweek as finished.',
-                'Prizes are paid only after FPL marks the final gameweek data_checked.',
-                'Standings use the qualifying FPL gameweek points recorded for the competition range.',
-                'If two or more users finish with the same highest score, the prize is split fairly among all tied winners.',
-              ];
+              league.name = copy.name;
+              league.description = copy.description;
+              league.competitionType = copy.competitionType;
+              league.ruleType = copy.ruleType;
+              league.rules = copy.rules;
               league.projectedPrizeCents = def.prizeCents;
               league.displayedPrizeCents = def.prizeCents;
               league.guaranteedPrize = true;
+              league.minimumParticipants = 1;
+              league.maximumParticipants = Math.max(Number(league.maximumParticipants || 0), 100000);
               league.fplJoinDeadlineAt = def.joinDeadlineAt;
               if (lifecycleFields.lastFixtureKickoffAt) league.fplLastFixtureKickoffAt = lifecycleFields.lastFixtureKickoffAt;
               if (schedule?.finished !== true && !['settled', 'cancelled'].includes(league.status)) league.expiresAt = null;
               await league.save();
             }
-            existing.joinDeadlineAt = def.joinDeadlineAt;
-            existing.prizeCents = def.prizeCents;
-            existing.entryFeeCents = def.entryFeeCents;
+            Object.assign(existing, definitionCopy(def));
             if (lifecycleFields.lastFixtureKickoffAt) existing.lastFixtureKickoffAt = lifecycleFields.lastFixtureKickoffAt;
             await existing.save();
             await LeagueAccessPolicy.updateOne(
               { leagueId: existing.leagueId },
               {
-                $set: {
-                  visibility: 'public',
-                  joinDeadlineAt: def.joinDeadlineAt,
-                  allowLateJoin: false,
-                  createdBy: creator._id,
-                },
+                $set: { visibility: 'public', joinDeadlineAt: def.joinDeadlineAt, allowLateJoin: false, createdBy: creator._id },
                 $setOnInsert: { inviteCode: `SUP${crypto.randomBytes(4).toString('hex').toUpperCase()}` },
               },
               { upsert: true }
@@ -6501,10 +7006,10 @@ const localGrowth = (() => {
           }
 
           const league = await League.create({
-            name: `Supreme ${def.cadence.replace('-', ' ')} — ${def.periodLabel}`,
-            description: isWeeklyPaidEntry ? weeklyDescription : standardDescription,
-            competitionType: def.cadence === 'bi-weekly' ? 'best-of-three' : def.cadence,
-            ruleType: isWeeklyPaidEntry ? 'weekly-entry' : 'subscription',
+            name: copy.name,
+            description: copy.description,
+            competitionType: copy.competitionType,
+            ruleType: copy.ruleType,
             cadence: def.cadence,
             officialSupremeLeague: true,
             customLeague: false,
@@ -6520,16 +7025,7 @@ const localGrowth = (() => {
             guaranteedPrize: true,
             minimumParticipants: 1,
             maximumParticipants: 100000,
-            rules: [
-              ...(isWeeklyPaidEntry
-                ? [`Weekly entry costs ${money(def.entryFeeCents)} unless an eligible subscription already includes the competition.`]
-                : ['Only users with an eligible active subscription are automatically entered.']),
-              'New entries close at the official FPL deadline for the first gameweek in this competition.',
-              'The competition remains live until FPL marks the final gameweek as finished.',
-              'Prizes are paid only after FPL marks the final gameweek data_checked.',
-              'Standings use the qualifying FPL gameweek points recorded for the competition range.',
-              'If two or more users finish with the same highest score, the prize is split fairly among all tied winners.',
-            ],
+            rules: copy.rules,
             createdBy: creator._id,
             expiresAt: schedule?.finished ? new Date() : null,
             fplJoinDeadlineAt: def.joinDeadlineAt,
@@ -6540,7 +7036,8 @@ const localGrowth = (() => {
           });
           await SupremeLeagueMeta.create({
             leagueId: league._id,
-            ...def,
+            ...definitionCopy(def),
+            cycleKey: def.cycleKey,
             lastFixtureKickoffAt: lifecycleFields.lastFixtureKickoffAt,
             finishedAt: lifecycleFields.finishedAt,
             dataCheckedAt: lifecycleFields.dataCheckedAt,
@@ -6555,7 +7052,7 @@ const localGrowth = (() => {
           });
           created += 1;
         }
-        return { created, reconciled, definitions: definitions.length };
+        return { created, reconciled, definitions: definitions.length, planningHorizonDays: SUPREME_PLANNING_HORIZON_DAYS };
       }
 
       const entitlementMap = {
@@ -6566,51 +7063,61 @@ const localGrowth = (() => {
         season: new Set(['weekly', 'bi-weekly', 'monthly', 'half-season', 'season']),
         'season-pass': new Set(['weekly', 'bi-weekly', 'monthly', 'half-season', 'season']),
       };
-    
+
       function subscriptionEntitles(subscription, cadence, meta = null) {
         if (!subscription) return false;
         const code = String(subscription.planCode || '').trim();
-
-        // Monthly Entry belongs to exactly one FPL calendar-month cycle. validUntil
-        // can cross month-end so the final GW can finish, but that must never grant
-        // access to the next month's Supreme Monthly League.
         if (code === 'monthly' && cadence === 'monthly') {
           const metaCycleMatch = String(meta?.cycleKey || '').match(/:monthly:(\d{4}-\d{2})$/);
           const metaCycleKey = metaCycleMatch?.[1] || '';
           const storedCycleKey = String(subscription.monthlyCycleKey || '').trim();
           if (metaCycleKey && storedCycleKey && metaCycleKey !== storedCycleKey) return false;
-
-          // Conservative legacy fallback until reconciliation fills monthlyCycleKey.
           if (metaCycleKey && !storedCycleKey) {
             const anchor = subscription.activatedAt || subscription.startDate || subscription.createdAt;
             const inferred = anchor ? utcMonthKey(anchor) : '';
             if (inferred && inferred !== metaCycleKey) return false;
           }
         }
-
         if (Array.isArray(subscription.competitionsIncluded) && subscription.competitionsIncluded.includes(cadence)) return true;
         return entitlementMap[code]?.has(cadence) || false;
       }
-    
-      async function enrollSubscribersInSupremeLeagues() {
+
+      async function activeSubscriptionsForUsers(userIds, now = new Date()) {
+        return Subscription.find({
+          ...(userIds?.length ? { userId: { $in: userIds } } : {}),
+          status: 'active',
+          $or: [
+            { endDate: { $gt: now } },
+            { validUntil: { $gt: now } },
+            { endDate: null, validUntil: null },
+          ],
+        }).lean();
+      }
+
+      async function enrollSubscribersInSupremeLeagues({ userId = null } = {}) {
         const now = new Date();
         const metas = await SupremeLeagueMeta.find({ settlementStatus: 'open', joinDeadlineAt: { $gt: now } }).lean();
         let enrolled = 0;
-    
+        let freeEntries = 0;
+        let subscriptionEntries = 0;
+
+        const userFilter = { role: 'user', status: 'active', fplManagerId: { $exists: true, $nin: ['', null] } };
+        if (userId) userFilter._id = userId;
+        const users = await User.find(userFilter).select('_id fplManagerId').lean();
+        const userIds = users.map((user) => user._id);
+        const subscriptions = await activeSubscriptionsForUsers(userIds, now);
+        const subscriptionsByUser = new Map();
+        for (const sub of subscriptions) {
+          const key = String(sub.userId);
+          if (!subscriptionsByUser.has(key)) subscriptionsByUser.set(key, []);
+          subscriptionsByUser.get(key).push(sub);
+        }
+
         for (const meta of metas) {
-          const subscriptions = await Subscription.find({
-            status: 'active',
-            $or: [
-              { endDate: { $gt: now } },
-              { validUntil: { $gt: now } },
-              { endDate: null, validUntil: null },
-            ],
-          }).lean();
-    
-          for (const sub of subscriptions) {
-            if (!subscriptionEntitles(sub, meta.cadence, meta)) continue;
-            const user = await User.findById(sub.userId).lean();
-            if (!user || user.status === 'suspended' || !user.fplManagerId) continue;
+          for (const user of users) {
+            const isFreeForAll = meta.entryMode === 'free-all';
+            const includedBySubscription = (subscriptionsByUser.get(String(user._id)) || []).some((sub) => subscriptionEntitles(sub, meta.cadence, meta));
+            if (!isFreeForAll && !includedBySubscription) continue;
             const exists = await LeagueEntry.exists({ leagueId: meta.leagueId, userId: user._id });
             if (exists) continue;
             await LeagueEntry.create({
@@ -6620,7 +7127,7 @@ const localGrowth = (() => {
               joinedAt: new Date(),
               paymentStatus: 'paid',
               eligibilityStatus: 'eligible',
-              eligibilityReason: 'Included with active subscription',
+              eligibilityReason: isFreeForAll ? 'Free Clash of the Captains entry' : 'Included with active subscription',
               currentScore: 0,
               currentRank: null,
               previousRank: null,
@@ -6628,11 +7135,19 @@ const localGrowth = (() => {
               payoutStatus: 'not-applicable',
             });
             enrolled += 1;
+            if (isFreeForAll) freeEntries += 1; else subscriptionEntries += 1;
           }
         }
-        return { enrolled };
+        return { enrolled, freeEntries, subscriptionEntries, usersChecked: users.length };
       }
-    
+
+      async function enrollUserInOpenSupremeLeagues(userId) {
+        if (!userId) return { enrolled: 0 };
+        if (FPL_DATA_MODE !== 'public') return { enrolled: 0, skipped: true, reason: 'fpl-data-mode-not-public' };
+        await ensureSupremeLeagues();
+        return enrollSubscribersInSupremeLeagues({ userId });
+      }
+
       async function managerPoints(managerId, startGameweek, endGameweek) {
         const response = await fetch(`${fplBaseUrl}/entry/${encodeURIComponent(managerId)}/history/`, { headers: { Accept: 'application/json' } });
         if (!response.ok) throw new Error(`FPL manager ${managerId} history returned HTTP ${response.status}.`);
@@ -6641,93 +7156,100 @@ const localGrowth = (() => {
           .filter((item) => Number(item.event) >= startGameweek && Number(item.event) <= endGameweek)
           .reduce((sum, item) => sum + Number(item.points || 0), 0);
       }
-    
-      async function creditPrize({ userId, leagueId, amountCents, reference }) {
+
+      async function captainVicePoints(managerId, gameweek) {
+        const picks = await publicFantasyProvider.getManagerPicks(managerId, gameweek);
+        const captain = (picks.lineup || []).find((player) => player.isCaptain);
+        const viceCaptain = (picks.lineup || []).find((player) => player.isViceCaptain);
+        if (!captain || !viceCaptain) throw new Error(`FPL picks for manager ${managerId} do not expose both captain and vice-captain for Gameweek ${gameweek}.`);
+        return {
+          score: Number(captain.points || 0) + Number(viceCaptain.points || 0),
+          details: {
+            scoringMode: 'captain-vice',
+            gameweek: Number(gameweek),
+            captain: { elementId: captain.elementId, name: captain.name, club: captain.club, points: Number(captain.points || 0) },
+            viceCaptain: { elementId: viceCaptain.elementId, name: viceCaptain.name, club: viceCaptain.club, points: Number(viceCaptain.points || 0) },
+          },
+        };
+      }
+
+      async function creditPrize({ userId, leagueId, amountCents, reference, description = 'Supreme league prize' }) {
         const balanceField = walletBalanceField();
         const tx = await Transaction.findOneAndUpdate({ reference }, { $setOnInsert: {
-          userId,
-          leagueId,
-          reference,
-          type: 'prize',
-          direction: 'credit',
-          amountCents,
-          currency: 'USD',
-          provider: 'supreme',
-          providerReference: reference,
-          status: 'completed',
-          description: 'Supreme league prize',
-          metadata: { purpose: 'supreme-league-prize' },
+          userId, leagueId, reference, type: 'prize', direction: 'credit', amountCents,
+          currency: 'USD', provider: 'supreme', providerReference: reference, status: 'completed',
+          description, metadata: { purpose: 'supreme-league-prize' },
         } }, { upsert: true, new: true });
         await updateWalletBalances(userId, { [balanceField]: amountCents, lifetimePrizesCents: amountCents }, `Supreme league prize ${reference}`, 'settleSupremeLeague', {}, `${reference}:wallet-credit`);
         return tx;
       }
-    
-      async function settleSupremeLeague(meta, bootstrap) {
-        const events = bootstrap.events || [];
-        const relevant = events.filter((event) => Number(event.id) >= meta.startGameweek && Number(event.id) <= meta.endGameweek);
-        if (!relevant.length || relevant.some((event) => event.finished !== true)) {
+
+      async function scoreSupremeEntry(entry, meta) {
+        if (!entry.fantasyManagerId) throw new Error('No FPL manager ID is stored for this Supreme league entry.');
+        if (meta.scoringMode === 'captain-vice') {
+          return captainVicePoints(entry.fantasyManagerId, meta.endGameweek);
+        }
+        return { score: await managerPoints(entry.fantasyManagerId, meta.startGameweek, meta.endGameweek), details: { scoringMode: 'manager-points' } };
+      }
+
+      async function settleSupremeLeague(meta, bootstrap, options = {}) {
+        const verified = await getVerifiedFplRangeState(meta.startGameweek, meta.endGameweek, { bootstrap });
+        const now = new Date();
+        meta.lastSettlementAttemptAt = now;
+        if (!verified.finished) {
           meta.settlementStatus = 'open';
           meta.settlementLockId = '';
           meta.settlementLockedAt = null;
-          meta.lastMaintenanceAt = new Date();
+          meta.lastMaintenanceAt = now;
+          meta.lastError = `Football is not verified finished (${verified.reason}).`;
           await meta.save();
-          return { settled: false, reason: 'not-finished' };
+          return { settled: false, reason: 'not-finished', verified };
         }
 
-        const observedFinishedAt = meta.finishedAt || new Date();
+        const observedFinishedAt = meta.finishedAt || now;
         meta.finishedAt = observedFinishedAt;
+        if (verified.lastFixtureKickoffAt) meta.lastFixtureKickoffAt = verified.lastFixtureKickoffAt;
         await League.updateOne(
           { _id: meta.leagueId, status: { $nin: ['settled', 'cancelled'] } },
-          {
-            $set: {
-              status: 'awaiting-review',
-              expiresAt: observedFinishedAt,
-              fplFinishedAt: observedFinishedAt,
-              completedAt: observedFinishedAt,
-            },
-          }
+          { $set: { status: 'awaiting-review', expiresAt: observedFinishedAt, fplFinishedAt: observedFinishedAt, completedAt: observedFinishedAt, ...(verified.lastFixtureKickoffAt ? { fplLastFixtureKickoffAt: verified.lastFixtureKickoffAt } : {}) } }
         );
 
-        if (relevant.some((event) => event.data_checked !== true)) {
+        if (!verified.dataChecked && !options.forceDataChecked) {
           meta.settlementStatus = 'open';
           meta.settlementLockId = '';
           meta.settlementLockedAt = null;
-          meta.lastMaintenanceAt = new Date();
+          meta.lastMaintenanceAt = now;
           meta.lastError = '';
           await meta.save();
-          return { settled: false, reason: 'awaiting-data-check' };
+          return { settled: false, reason: 'awaiting-data-check', verified };
         }
 
-        meta.dataCheckedAt = meta.dataCheckedAt || new Date();
+        meta.dataCheckedAt = meta.dataCheckedAt || (verified.dataChecked ? now : null);
         meta.settlementStatus = 'scoring';
-        meta.lastMaintenanceAt = new Date();
+        meta.lastMaintenanceAt = now;
+        if (options.manualBy) {
+          meta.manualSettlementAt = now;
+          meta.manualSettlementBy = options.manualBy;
+          meta.manualSettlementReason = String(options.reason || 'Administrator settlement').slice(0, 500);
+        }
         await meta.save();
-
-        await League.updateOne(
-          { _id: meta.leagueId },
-          { $set: { fplDataCheckedAt: meta.dataCheckedAt } }
-        );
+        await League.updateOne({ _id: meta.leagueId }, { $set: { ...(meta.dataCheckedAt ? { fplDataCheckedAt: meta.dataCheckedAt } : {}) } });
 
         const entries = await LeagueEntry.find({
           leagueId: meta.leagueId,
           paymentStatus: { $in: ['paid', 'completed'] },
           eligibilityStatus: { $ne: 'ineligible' },
         });
+        if (!entries.length) throw new Error('No eligible paid entries exist for this competition, so no prize can be settled.');
+
         const scored = [];
         const scoreFailures = [];
         for (const entry of entries) {
-          if (!entry.fantasyManagerId) {
-            entry.lastScoreSyncAt = new Date();
-            entry.scoreSyncStatus = 'failed';
-            entry.scoreSyncError = 'No FPL manager ID is stored for this Supreme league entry.';
-            await entry.save();
-            scoreFailures.push(`${entry._id}: missing FPL manager ID`);
-            continue;
-          }
           try {
-            const score = await managerPoints(entry.fantasyManagerId, meta.startGameweek, meta.endGameweek);
+            const scoredEntry = await scoreSupremeEntry(entry, meta);
             entry.previousRank = entry.currentRank || null;
-            entry.currentScore = score;
+            entry.currentScore = Number(scoredEntry.score || 0);
+            entry.scoreDetails = scoredEntry.details || {};
             entry.scoreThroughGameweek = meta.endGameweek;
             entry.lastScoreSyncAt = new Date();
             entry.scoreSyncStatus = 'success';
@@ -6740,12 +7262,10 @@ const localGrowth = (() => {
             entry.scoreSyncError = String(error.message || error).slice(0, 500);
             await entry.save();
             scoreFailures.push(`${entry._id}: ${entry.scoreSyncError}`);
-            console.error(`Supreme score sync failed for entry ${entry._id}:`, error.message);
           }
         }
-
         if (scoreFailures.length) {
-          throw new Error(`Supreme settlement paused because ${scoreFailures.length} eligible entr${scoreFailures.length === 1 ? 'y' : 'ies'} could not be scored from FPL. ${scoreFailures.slice(0, 3).join(' | ')}`);
+          throw new Error(`Settlement paused because ${scoreFailures.length} eligible entr${scoreFailures.length === 1 ? 'y' : 'ies'} could not be scored from FPL. ${scoreFailures.slice(0, 3).join(' | ')}`);
         }
 
         scored.sort((a, b) => Number(b.currentScore || 0) - Number(a.currentScore || 0) || new Date(a.joinedAt || 0) - new Date(b.joinedAt || 0));
@@ -6758,11 +7278,10 @@ const localGrowth = (() => {
         });
         await Promise.all(scored.map((entry) => entry.save()));
 
-        const topScore = scored.length ? Number(scored[0].currentScore || 0) : null;
-        const winners = topScore === null ? [] : scored.filter((entry) => Number(entry.currentScore || 0) === topScore);
-        const baseSplit = winners.length ? Math.floor(meta.prizeCents / winners.length) : 0;
-        let remainder = winners.length ? meta.prizeCents - baseSplit * winners.length : 0;
-
+        const topScore = Number(scored[0].currentScore || 0);
+        const winners = scored.filter((entry) => Number(entry.currentScore || 0) === topScore);
+        const baseSplit = Math.floor(Number(meta.prizeCents || 0) / winners.length);
+        let remainder = Number(meta.prizeCents || 0) - baseSplit * winners.length;
         for (let index = 0; index < winners.length; index += 1) {
           const entry = winners[index];
           const amount = baseSplit + (remainder > 0 ? 1 : 0);
@@ -6770,7 +7289,7 @@ const localGrowth = (() => {
           entry.prizeCents = amount;
           entry.payoutStatus = 'paid';
           await entry.save();
-          await creditPrize({ userId: entry.userId, leagueId: meta.leagueId, amountCents: amount, reference: `SUP-PRIZE-${meta._id}-${entry.userId}` });
+          await creditPrize({ userId: entry.userId, leagueId: meta.leagueId, amountCents: amount, reference: `SUP-PRIZE-${meta._id}-${entry.userId}`, description: meta.scoringMode === 'captain-vice' ? 'Clash of the Captains prize' : 'Supreme league prize' });
         }
 
         const league = await League.findById(meta.leagueId).lean();
@@ -6785,12 +7304,12 @@ const localGrowth = (() => {
             to: user.email,
             category: won ? 'competition-win' : 'competition-result',
             subject: won ? `You finished on top — ${league?.name || 'Supreme competition'}` : `Final standings are in — ${league?.name || 'Supreme competition'}`,
-            preheader: won ? 'Your prize has been credited.' : 'View your final standing.',
+            preheader: won ? 'Your prize has been credited and is available in your wallet.' : 'View your final standing.',
             title: won ? 'Congratulations — you finished on top' : 'The competition has been settled',
             tone: won ? 'success' : 'brand',
             message: won
-              ? `<p style="margin:0;">You finished with the joint-highest qualifying score. The prize was split fairly among all tied winners and your share has been credited to your wallet.</p>`
-              : `<p style="margin:0;">The final result is now available. You did not finish among the winners this time, but your score and rank remain available in your league history.</p>`,
+              ? `<p style="margin:0;">You finished with the highest qualifying score${winners.length > 1 ? ' (tied for first)' : ''}. Your ${money(entry.prizeCents)} prize share has been credited to your Supreme wallet and is available for withdrawal.</p>`
+              : `<p style="margin:0;">The final result is now available. Your score and rank remain available in your league history.</p>`,
             buttonLabel: 'View final standings',
             buttonUrl: `${appUrl}/app/leagues/${meta.leagueId}`,
             details: [
@@ -6803,18 +7322,10 @@ const localGrowth = (() => {
         }
 
         const settledAt = new Date();
-        await League.updateOne(
-          { _id: meta.leagueId },
-          {
-            $set: {
-              status: 'settled',
-              completedAt: observedFinishedAt,
-              expiresAt: observedFinishedAt,
-              fplFinishedAt: observedFinishedAt,
-              fplDataCheckedAt: meta.dataCheckedAt,
-            },
-          }
-        );
+        await League.updateOne({ _id: meta.leagueId }, { $set: {
+          status: 'settled', completedAt: observedFinishedAt, expiresAt: observedFinishedAt, fplFinishedAt: observedFinishedAt,
+          ...(meta.dataCheckedAt ? { fplDataCheckedAt: meta.dataCheckedAt } : {}),
+        } });
         meta.settlementStatus = 'settled';
         meta.settledAt = settledAt;
         meta.winnerUserIds = winners.map((entry) => entry.userId);
@@ -6823,105 +7334,112 @@ const localGrowth = (() => {
         meta.settlementLockId = '';
         meta.settlementLockedAt = null;
         await meta.save();
-        return { settled: true, winners: winners.length };
+        return { settled: true, winners: winners.length, prizeCents: meta.prizeCents, verified };
+      }
+
+      async function getSettlementDiagnostics(leagueId, { verifyLive = true } = {}) {
+        const meta = await SupremeLeagueMeta.findOne({ leagueId }).lean();
+        if (!meta) return null;
+        let verified = null;
+        if (verifyLive) {
+          const bootstrap = await fetchFplBootstrap();
+          verified = await getVerifiedFplRangeState(meta.startGameweek, meta.endGameweek, { bootstrap });
+        }
+        const entries = await LeagueEntry.find({ leagueId }).select('paymentStatus eligibilityStatus scoreSyncStatus scoreSyncError currentScore currentRank fantasyManagerId').lean();
+        const eligible = entries.filter((entry) => ['paid', 'completed'].includes(entry.paymentStatus) && entry.eligibilityStatus !== 'ineligible');
+        return {
+          meta,
+          verified: verified ? {
+            finished: verified.finished,
+            dataChecked: verified.dataChecked,
+            reason: verified.reason,
+            fixtureStates: verified.schedules.map((schedule) => ({ gameweek: schedule.gameweek, eventFinished: schedule.eventFinished, fixturesFinished: schedule.fixturesFinished, fixtureCount: schedule.fixtureCount, dataChecked: schedule.dataChecked, provisionalOnly: schedule.hasProvisionalOnlyFixtures })),
+          } : {
+            finished: Boolean(meta.finishedAt),
+            dataChecked: Boolean(meta.dataCheckedAt),
+            reason: 'Cached lifecycle state. Live FPL verification refreshes automatically after this page renders.',
+            fixtureStates: [],
+            cached: true,
+          },
+          participants: entries.length,
+          eligibleParticipants: eligible.length,
+          successfullyScored: eligible.filter((entry) => entry.scoreSyncStatus === 'success').length,
+          scoreFailures: eligible.filter((entry) => entry.scoreSyncStatus === 'failed').map((entry) => entry.scoreSyncError).filter(Boolean),
+          readyForAutomaticSettlement: Boolean((verified?.finished || meta.finishedAt) && (verified?.dataChecked || meta.dataCheckedAt) && eligible.length > 0),
+          canManualSettle: Boolean((verified?.finished || meta.finishedAt) && eligible.length > 0),
+        };
+      }
+
+      async function settleLeagueById(leagueId, options = {}) {
+        const meta = await SupremeLeagueMeta.findOne({ leagueId });
+        if (!meta) return { settled: false, reason: 'not-supreme-league' };
+        if (meta.settlementStatus === 'settled') return { settled: true, alreadySettled: true, winners: meta.winnerUserIds?.length || 0 };
+        const bootstrap = await fetchFplBootstrap();
+        const verified = await getVerifiedFplRangeState(meta.startGameweek, meta.endGameweek, { bootstrap });
+        if (!verified.finished) {
+          const error = new Error('FPL has not verified that all football in this competition is finished. Manual settlement cannot bypass unfinished fixtures.');
+          error.status = 409;
+          throw error;
+        }
+        if (!verified.dataChecked && !options.forceDataChecked) return { settled: false, reason: 'awaiting-data-check', verified };
+
+        const now = new Date();
+        const staleLockBefore = new Date(now.getTime() - 15 * 60 * 1000);
+        const lockId = createReference('SET');
+        const locked = await SupremeLeagueMeta.findOneAndUpdate(
+          {
+            _id: meta._id,
+            $or: [
+              { settlementStatus: { $in: ['open', 'failed'] } },
+              { settlementStatus: 'scoring', settlementLockedAt: { $lte: staleLockBefore } },
+              { settlementStatus: 'scoring', settlementLockedAt: null },
+            ],
+          },
+          { $set: { settlementStatus: 'scoring', settlementLockId: lockId, settlementLockedAt: now, lastSettlementAttemptAt: now, ...(verified.dataChecked ? { dataCheckedAt: meta.dataCheckedAt || now } : {}) } },
+          { new: true }
+        );
+        if (!locked) return { settled: false, reason: 'settlement-already-running' };
+        try {
+          return await settleSupremeLeague(locked, bootstrap, options);
+        } catch (error) {
+          locked.settlementStatus = 'failed';
+          locked.settlementLockId = '';
+          locked.settlementLockedAt = null;
+          locked.lastError = String(error.message || error).slice(0, 1000);
+          locked.lastMaintenanceAt = new Date();
+          await locked.save();
+          throw error;
+        }
       }
 
       async function settleFinishedSupremeLeagues() {
         const bootstrap = await fetchFplBootstrap();
-        const now = new Date();
-        const staleLockBefore = new Date(now.getTime() - 15 * 60 * 1000);
-        const retryable = {
-          $or: [
-            { settlementStatus: { $in: ['open', 'failed'] } },
-            { settlementStatus: 'scoring', settlementLockedAt: { $lte: staleLockBefore } },
-            { settlementStatus: 'scoring', settlementLockedAt: null },
-            { settlementStatus: 'scoring', settlementLockedAt: { $exists: false } },
-          ],
-        };
-        const metas = await SupremeLeagueMeta.find(retryable).select('_id startGameweek endGameweek leagueId finishedAt dataCheckedAt');
+        const candidates = await SupremeLeagueMeta.find({ settlementStatus: { $in: ['open', 'failed', 'scoring'] } }).select('_id leagueId startGameweek endGameweek settlementStatus settlementLockedAt');
         let settled = 0;
         let footballFinished = 0;
         let awaitingDataCheck = 0;
-
-        for (const candidate of metas) {
-          const relevant = (bootstrap.events || []).filter(
-            (event) => Number(event.id) >= Number(candidate.startGameweek) && Number(event.id) <= Number(candidate.endGameweek)
-          );
-          if (!relevant.length || relevant.some((event) => event.finished !== true)) continue;
-
-          footballFinished += 1;
-          const observedFinishedAt = candidate.finishedAt || now;
-          await League.updateOne(
-            { _id: candidate.leagueId, status: { $nin: ['settled', 'cancelled'] } },
-            {
-              $set: {
-                status: 'awaiting-review',
-                expiresAt: observedFinishedAt,
-                fplFinishedAt: observedFinishedAt,
-                completedAt: observedFinishedAt,
-              },
-            }
-          );
-          await SupremeLeagueMeta.updateOne(
-            { _id: candidate._id, finishedAt: null },
-            { $set: { finishedAt: observedFinishedAt, lastMaintenanceAt: now } }
-          );
-
-          if (relevant.some((event) => event.data_checked !== true)) {
-            awaitingDataCheck += 1;
-            await SupremeLeagueMeta.updateOne(
-              { _id: candidate._id, settlementStatus: { $ne: 'settled' } },
-              {
-                $set: {
-                  settlementStatus: 'open',
-                  settlementLockId: '',
-                  settlementLockedAt: null,
-                  lastMaintenanceAt: now,
-                  lastError: '',
-                },
-              }
-            );
-            continue;
-          }
-
-          const lockId = createReference('SET');
-          const meta = await SupremeLeagueMeta.findOneAndUpdate(
-            {
-              _id: candidate._id,
-              $or: [
-                { settlementStatus: { $in: ['open', 'failed'] } },
-                { settlementStatus: 'scoring', settlementLockedAt: { $lte: staleLockBefore } },
-                { settlementStatus: 'scoring', settlementLockedAt: null },
-                { settlementStatus: 'scoring', settlementLockedAt: { $exists: false } },
-              ],
-            },
-            {
-              $set: {
-                settlementStatus: 'scoring',
-                settlementLockId: lockId,
-                settlementLockedAt: now,
-                dataCheckedAt: candidate.dataCheckedAt || now,
-                lastMaintenanceAt: now,
-              },
-            },
-            { new: true }
-          );
-          if (!meta) continue;
-
+        let failed = 0;
+        for (const candidate of candidates) {
           try {
-            const result = await settleSupremeLeague(meta, bootstrap);
+            const verified = await getVerifiedFplRangeState(candidate.startGameweek, candidate.endGameweek, { bootstrap });
+            if (!verified.finished) continue;
+            footballFinished += 1;
+            if (!verified.dataChecked) {
+              awaitingDataCheck += 1;
+              const observedFinishedAt = new Date();
+              await League.updateOne({ _id: candidate.leagueId, status: { $nin: ['settled', 'cancelled'] } }, { $set: { status: 'awaiting-review', expiresAt: observedFinishedAt, fplFinishedAt: observedFinishedAt, completedAt: observedFinishedAt } });
+              await SupremeLeagueMeta.updateOne({ _id: candidate._id }, { $set: { finishedAt: observedFinishedAt, settlementStatus: 'open', settlementLockId: '', settlementLockedAt: null, lastMaintenanceAt: new Date(), lastError: '' } });
+              continue;
+            }
+            const result = await settleLeagueById(candidate.leagueId);
             if (result.settled) settled += 1;
           } catch (error) {
-            meta.settlementStatus = 'failed';
-            meta.settlementLockId = '';
-            meta.settlementLockedAt = null;
-            meta.lastError = String(error.message || error).slice(0, 1000);
-            meta.lastMaintenanceAt = new Date();
-            await meta.save();
-            console.error(`Supreme settlement failed for ${meta.cycleKey}:`, meta.lastError);
+            failed += 1;
+            await SupremeLeagueMeta.updateOne({ _id: candidate._id }, { $set: { settlementStatus: 'failed', settlementLockId: '', settlementLockedAt: null, lastError: String(error.message || error).slice(0, 1000), lastMaintenanceAt: new Date() } });
+            console.error(`Supreme settlement failed for league ${candidate.leagueId}:`, error.message);
           }
         }
-        return { settled, footballFinished, awaitingDataCheck };
+        return { settled, footballFinished, awaitingDataCheck, failed };
       }
 
       async function runMaintenance() {
@@ -7008,9 +7526,30 @@ const localGrowth = (() => {
     
         app.get('/api/supreme-leagues', requireAuth, async (req, res, next) => {
           try {
-            await refreshLeagueLifecycleIfStale();
-            const metas = await SupremeLeagueMeta.find({}).sort({ startGameweek: -1, createdAt: -1 }).lean();
+            const refreshRequested = String(req.query.refresh || '') === '1';
+            if (refreshRequested && FPL_DATA_MODE === 'public') {
+              // This request is fired automatically after the cached competition list
+              // is already visible. Do not make navigation wait on provisioning/FPL.
+              await Promise.allSettled([
+                refreshLeagueLifecycleIfStale(),
+                ensureSupremeLeagues(),
+              ]);
+              await enrollSubscribersInSupremeLeagues({ userId: req.user._id }).catch((error) => console.warn('Supreme page enrollment failed:', error.message));
+            }
+            const metas = await SupremeLeagueMeta.find({}).sort({ joinDeadlineAt: 1, startGameweek: 1 }).lean();
             const leagueIds = metas.map((meta) => meta.leagueId);
+            if (refreshRequested) {
+              const joinedLeagueIds = await LeagueEntry.find({
+                leagueId: { $in: leagueIds },
+                userId: req.user._id,
+                paymentStatus: { $in: ['paid', 'completed'] },
+              }).distinct('leagueId');
+              const refreshIds = joinedLeagueIds.slice(0, 6);
+              await Promise.allSettled(refreshIds.map(async (joinedLeagueId) => {
+                await settleLeagueById(joinedLeagueId, { trigger: 'supreme-page-background-refresh' }).catch(() => null);
+                return syncLeagueScores(joinedLeagueId, { force: false });
+              }));
+            }
             const [leagues, entries] = await Promise.all([
               League.find({ _id: { $in: leagueIds } }).lean(),
               LeagueEntry.find({ leagueId: { $in: leagueIds }, userId: req.user._id }).lean(),
@@ -7023,7 +7562,7 @@ const localGrowth = (() => {
               const myEntry = entryMap.get(String(meta.leagueId)) || null;
               const deadlineAt = meta.joinDeadlineAt ? new Date(meta.joinDeadlineAt) : null;
               const joined = myEntry?.paymentStatus === 'paid';
-              const weeklyPaidEntry = meta.cadence === 'weekly' && Number(league?.entryFeeCents ?? meta.entryFeeCents ?? 0) > 0;
+              const weeklyPaidEntry = meta.entryMode === 'weekly-flex' || (meta.cadence === 'weekly' && Number(league?.entryFeeCents ?? meta.entryFeeCents ?? 0) > 0);
               const joinOpen = Boolean(
                 weeklyPaidEntry
                 && !joined
@@ -7039,9 +7578,16 @@ const localGrowth = (() => {
                 joined,
                 joinOpen,
                 entryFeeCents: Number(league?.entryFeeCents ?? meta.entryFeeCents ?? 0),
+                prizeCents: meta.cadence === 'clash-captains'
+                  ? cents(process.env.SUPREME_CLASH_CAPTAINS_PRIZE_CENTS, 300)
+                  : Number(meta.prizeCents || league?.displayedPrizeCents || 0),
                 footballFinished: Boolean(meta.finishedAt || league?.fplFinishedAt || ['awaiting-review', 'settled'].includes(league?.status)),
                 scoringFinalized: Boolean(meta.dataCheckedAt || league?.fplDataCheckedAt || meta.settlementStatus === 'settled'),
                 includedWithSubscription: Boolean(joined && /included with active subscription/i.test(myEntry?.eligibilityReason || '')),
+                freeEntry: meta.entryMode === 'free-all',
+                paymentOptions: weeklyPaidEntry ? ['subscription', 'one-off'] : (meta.entryMode === 'free-all' ? ['free'] : ['subscription']),
+                scoringMode: meta.scoringMode || 'manager-points',
+                teamLinked: Boolean(req.user.fplManagerId),
                 tieRule: 'If two or more users finish with the same highest score, the prize is split fairly among all tied winners.',
               };
             }));
@@ -7068,7 +7614,10 @@ const localGrowth = (() => {
         notifySupportTicketReceived,
         ensureSupremeLeagues,
         enrollSubscribersInSupremeLeagues,
+        enrollUserInOpenSupremeLeagues,
         settleFinishedSupremeLeagues,
+        settleLeagueById,
+        getSettlementDiagnostics,
         runMaintenance,
         startTimers,
         sendEmail,
@@ -7114,7 +7663,7 @@ app.post('/api/admin/maintenance/reconcile-monthly-subscriptions', requireAdmin,
 
     if (FPL_DATA_MODE === 'public') {
       supremeCreated = await localGrowth.ensureSupremeLeagues();
-      supremeStateRepair = await localGrowth.recoverUnfinishedSupremeLeagueStates();
+      supremeStateRepair = await localGrowth.settleFinishedSupremeLeagues();
       supremeEnrollment = await localGrowth.enrollSubscribersInSupremeLeagues();
     }
 
@@ -7158,8 +7707,32 @@ async function claimDailyMaintenanceRun(now = new Date()) {
       startedAt: now,
     });
   } catch (error) {
-    if (error?.code === 11000) return null;
-    throw error;
+    if (error?.code !== 11000) throw error;
+
+    // A failed invocation must not block maintenance for the rest of the UTC day.
+    // Also reclaim a serverless run that was left "running" after a hard timeout.
+    const staleBefore = new Date(now.getTime() - 30 * 60 * 1000);
+    return MaintenanceRun.findOneAndUpdate(
+      {
+        _id: runKey,
+        $or: [
+          { status: 'failed' },
+          { status: 'running', startedAt: { $lte: staleBefore } },
+        ],
+      },
+      {
+        $set: {
+          status: 'running',
+          startedAt: now,
+          completedAt: null,
+          failedAt: null,
+          tasks: [],
+          summary: {},
+          error: '',
+        },
+      },
+      { new: true }
+    );
   }
 }
 
@@ -7169,13 +7742,15 @@ async function runDailyMaintenanceTasks() {
   await reconcilePendingPaynowPayments();
   const walletPurchases = await reconcileProcessingWalletPurchases();
   const backfilledManagerIds = await backfillLeagueEntryFantasyManagerIds();
-  const backfilledLeagueExpiries = await backfillLeagueExpiryDates();
   const expiredLeagues = await updateExpiredLeagueStatuses();
+
+  // Keep the financially important work near the front of the serverless run.
+  // Provisioning, enrollment and settlement must not wait behind a potentially
+  // large all-user team-sync batch; a function timeout must not strand prizes.
+  const growth = await localGrowth.runMaintenance();
   const leagueSyncs = await syncActiveLeagueScores();
   const teamSnapshots = await refreshMemberTeamSnapshots();
-  const staleTeamReminders = await emailService.sendStaleTeamReminders();
   const engagementEmails = await localGrowth.sendScheduledUserEmails();
-  const growth = await localGrowth.runMaintenance();
   return {
     tasks: [
       'reconcile-monthly-subscription-windows',
@@ -7183,22 +7758,18 @@ async function runDailyMaintenanceTasks() {
       'reconcile-paynow',
       'reconcile-wallet-purchases',
       'backfill-league-manager-ids',
-      'backfill-league-expiries',
       'update-expired-leagues',
+      'growth-maintenance',
       'sync-league-scores',
       'refresh-member-team-snapshots',
-      'send-stale-team-reminders',
-      'send-account-gameweek-and-subscription-reminders',
-      'growth-maintenance',
+      'send-account-league-gameweek-and-subscription-reminders',
     ],
     monthlySubscriptions,
     walletPurchases,
     backfilledManagerIds,
-    backfilledLeagueExpiries,
     expiredLeagues,
     leaguesScored: leagueSyncs.length,
     teamSnapshots,
-    staleTeamReminders,
     engagementEmails,
     growth,
   };
@@ -7357,6 +7928,13 @@ async function prepareRuntime() {
   if (!global.__sflRuntimePromise) {
     global.__sflRuntimePromise = (async () => {
       await connectDatabase();
+
+      // Vercel cold starts must stay lightweight. Running FPL bootstrap/fixture
+      // reconciliation here made every new serverless instance behave like a cron
+      // job before it could answer the user's request. Durable maintenance already
+      // runs through /api/internal/cron/maintenance and the local maintenance script.
+      if (IS_VERCEL) return true;
+
       await ensureDemoUser();
       if (SEED_DEMO_DATA) await ensureDemoLeagues();
       await backfillLeagueEntryFantasyManagerIds();
@@ -7415,17 +7993,17 @@ async function start() {
       () => updateExpiredLeagueStatuses().catch((error) => console.error('League lifecycle update failed', error.message)),
       Math.min(FPL_LEAGUE_SYNC_INTERVAL_MS, 15 * 60 * 1000)
     );
-    const teamReminderTimer = setInterval(
-      () => emailService.sendStaleTeamReminders().catch((error) => console.error('Team reminder check failed', error.message)),
-      emailService.reminderCheckIntervalMs
+    const teamSnapshotTimer = setInterval(
+      () => refreshMemberTeamSnapshots().catch((error) => console.error('Daily FPL team refresh failed', error.message)),
+      24 * 60 * 60 * 1000
     );
-    emailService.sendStaleTeamReminders().catch((error) => console.error('Initial team reminder check failed', error.message));
+    refreshMemberTeamSnapshots().catch((error) => console.error('Initial FPL team refresh failed', error.message));
     localGrowth.startTimers();
     subscriptionTimer.unref?.();
     paynowTimer.unref?.();
     leagueScoreTimer.unref?.();
     leagueLifecycleTimer.unref?.();
-    teamReminderTimer.unref?.();
+    teamSnapshotTimer.unref?.();
   }
   return server;
 }
@@ -7440,3 +8018,7 @@ if (require.main === module) {
 module.exports = app;
 module.exports.prepareRuntime = prepareRuntime;
 module.exports.connectDatabase = connectDatabase;
+module.exports.runGrowthMaintenance = async function runGrowthMaintenance() {
+  await prepareRuntime();
+  return localGrowth.runMaintenance();
+};
