@@ -7,6 +7,7 @@ const app = require('../server');
 const FPL_BASE_URL = String(process.env.FPL_BASE_URL || 'https://fantasy.premierleague.com/api').replace(/\/$/, '');
 const WEEKLY_ENTRY_FEE_CENTS = Number.parseInt(process.env.SUPREME_WEEKLY_ENTRY_FEE_CENTS || '100', 10);
 const WEEKLY_PRIZE_CENTS = Number.parseInt(process.env.SUPREME_WEEKLY_PRIZE_CENTS || '1000', 10);
+const CLASH_PRIZE_CENTS = Number.parseInt(process.env.SUPREME_CLASH_CAPTAINS_PRIZE_CENTS || '300', 10);
 const REQUEST_TIMEOUT_MS = Math.max(3000, Math.min(30000, Number(process.env.FPL_REQUEST_TIMEOUT_MS || 12000)));
 const DRY_RUN = process.argv.includes('--dry-run');
 
@@ -87,6 +88,7 @@ async function main() {
     markedFootballFinished: 0,
     awaitingDataCheck: 0,
     weeklyPriceCorrections: 0,
+    clashPrizeCorrections: 0,
     resetStaleSettlementLocks: 0,
     skippedMissingFplEvent: 0,
   };
@@ -158,6 +160,18 @@ async function main() {
         meta.entryMode = 'weekly-flex';
         meta.scoringMode = 'manager-points';
         summary.weeklyPriceCorrections += 1;
+      }
+
+      if (meta.cadence === 'clash-captains') {
+        league.entryFeeCents = 0;
+        league.projectedPrizeCents = CLASH_PRIZE_CENTS;
+        league.displayedPrizeCents = CLASH_PRIZE_CENTS;
+        league.guaranteedPrize = true;
+        meta.entryFeeCents = 0;
+        meta.prizeCents = CLASH_PRIZE_CENTS;
+        meta.entryMode = 'free-all';
+        meta.scoringMode = 'captain-vice';
+        summary.clashPrizeCorrections += 1;
       }
 
       const lockIsStale = meta.settlementStatus === 'scoring'
