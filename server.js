@@ -22,6 +22,8 @@ const IS_PRODUCTION = String(process.env.NODE_ENV || '').trim().toLowerCase() ==
 const IS_VERCEL = Boolean(process.env.VERCEL);
 const PAYMENTS_MODE = String(process.env.PAYMENTS_MODE || 'mock').trim().toLowerCase();
 const MOCK_PAYMENTS = PAYMENTS_MODE === 'mock';
+const ALLOW_PRODUCTION_MOCK_FINANCIALS = String(process.env.ALLOW_PRODUCTION_MOCK_FINANCIALS || '').trim().toLowerCase() === 'true';
+const MOCK_FINANCIALS_ALLOWED = MOCK_PAYMENTS && (!IS_PRODUCTION || ALLOW_PRODUCTION_MOCK_FINANCIALS);
 const PAYNOW_PAYMENTS = PAYMENTS_MODE === 'paynow';
 const PAYNOW_TEST_MODE = String(process.env.PAYNOW_TEST_MODE || 'true').trim().toLowerCase() !== 'false';
 const PAYNOW_TEST_AUTH_EMAIL = String(process.env.PAYNOW_TEST_AUTH_EMAIL || '').trim().toLowerCase();
@@ -497,6 +499,8 @@ const leagueEntrySchema = new Schema({
   paymentTransactionId: { type: Schema.Types.ObjectId, ref: 'Transaction', default: null },
   paymentReference: { type: String, default: '' },
   paymentMethod: { type: String, default: '' },
+  entrySource: { type: String, default: '', enum: ['', 'one-off', 'subscription', 'free', 'admin'] },
+  subscriptionId: { type: Schema.Types.ObjectId, ref: 'Subscription', default: null },
   eligibilityStatus: { type: String, default: 'eligible', enum: ['eligible', 'warning', 'ineligible'] },
   eligibilityReason: { type: String, default: '' },
   lastConfirmedGameweek: { type: Number, default: 0 },
@@ -784,6 +788,127 @@ function resolveSubscriptionPlan(value) {
   return Object.values(PLANS).find((item) => item.planCode === canonicalCode) || null;
 }
 
+function assertPaidCheckoutConfigured() {
+  if (IS_PRODUCTION && MOCK_PAYMENTS && !ALLOW_PRODUCTION_MOCK_FINANCIALS) {
+    const error = new Error('Paid checkouts are disabled because the production server is running with PAYMENTS_MODE=mock. Set PAYMENTS_MODE=paynow before accepting paid entries or subscriptions.');
+    error.status = 503;
+    throw error;
+  }
+}
+
+function canonicalPlanAmountCents(plan) {
+  const amount = Number(plan?.amountCents || 0);
+  if (!Number.isInteger(amount) || amount <= 0) {
+    const error = new Error('This subscription plan does not have a valid positive price.');
+    error.status = 500;
+    throw error;
+  }
+  return amount;
+}
+
+function subscriptionPaymentVerification(subscription, transaction = null) {
+  const plan = resolveSubscriptionPlan(subscription?.planCode);
+  if (!plan) return { verified: false, reason: 'unknown-plan' };
+  const expectedAmountCents = Number(plan.amountCents || 0);
+  if (!Number.isInteger(expectedAmountCents) || expectedAmountCents <= 0) return { verified: false, reason: 'invalid-plan-price' };
+  if (Number(subscription?.amountCents || 0) !== expectedAmountCents) return { verified: false, reason: 'subscription-price-mismatch' };
+  if (!subscription?.paymentTransactionId) return { verified: false, reason: 'missing-payment-transaction' };
+  if (!transaction) return { verified: false, reason: 'payment-transaction-not-found' };
+  if (String(transaction._id) !== String(subscription.paymentTransactionId)) return { verified: false, reason: 'payment-transaction-id-mismatch' };
+  if (String(transaction.userId) !== String(subscription.userId)) return { verified: false, reason: 'payment-user-mismatch' };
+  if (transaction.type !== 'subscription' || transaction.direction !== 'debit') return { verified: false, reason: 'wrong-payment-type' };
+  if (transaction.status !== 'completed') return { verified: false, reason: `payment-${transaction.status || 'unknown'}` };
+  if (Number(transaction.amountCents || 0) !== expectedAmountCents) return { verified: false, reason: 'payment-price-mismatch' };
+  if (transaction.provider === 'mock' && !MOCK_FINANCIALS_ALLOWED) return { verified: false, reason: 'mock-payment-not-authorized-for-entitlements' };
+  return { verified: true, reason: 'verified', expectedAmountCents };
+}
+
+async function verifiedSubscriptions(subscriptions = [], { markInvalid = false } = {}) {
+  const items = Array.isArray(subscriptions) ? subscriptions : [];
+  const transactionIds = items.map((subscription) => subscription.paymentTransactionId).filter(Boolean);
+  const transactions = transactionIds.length
+    ? await Transaction.find({ _id: { $in: transactionIds } }).select('_id userId type direction amountCents provider status reference createdAt').lean()
+    : [];
+  const transactionMap = new Map(transactions.map((transaction) => [String(transaction._id), transaction]));
+
+  // Wallet subscriptions must be backed by real ledger credits that existed before the
+  // purchase. This rejects historical/demo wallet seeds that were only numbers on the
+  // Wallet document and never represented by a completed deposit/prize/refund/bonus.
+  const targetWalletTransactions = transactions.filter((transaction) => transaction.provider === 'wallet');
+  const walletFundingMap = new Map();
+  if (targetWalletTransactions.length) {
+    const walletUserIds = [...new Set(targetWalletTransactions.map((transaction) => String(transaction.userId)))].map((id) => new mongoose.Types.ObjectId(id));
+    const history = await Transaction.find({
+      userId: { $in: walletUserIds },
+      status: 'completed',
+      $or: [
+        { direction: 'credit' },
+        { direction: 'debit', provider: 'wallet' },
+        { direction: 'debit', type: 'withdrawal' },
+      ],
+    }).select('_id userId direction amountCents provider type createdAt').sort({ userId: 1, createdAt: 1, _id: 1 }).lean();
+    const targetIds = new Set(targetWalletTransactions.map((transaction) => String(transaction._id)));
+    const balances = new Map();
+    for (const transaction of history) {
+      const key = String(transaction.userId);
+      const balanceBefore = Number(balances.get(key) || 0);
+      if (targetIds.has(String(transaction._id))) {
+        walletFundingMap.set(String(transaction._id), balanceBefore >= Number(transaction.amountCents || 0));
+      }
+      const delta = transaction.direction === 'credit' ? Number(transaction.amountCents || 0) : -Number(transaction.amountCents || 0);
+      balances.set(key, balanceBefore + delta);
+    }
+  }
+
+  const verified = [];
+  const invalid = [];
+  for (const subscription of items) {
+    const transaction = transactionMap.get(String(subscription.paymentTransactionId || '')) || null;
+    const check = subscriptionPaymentVerification(subscription, transaction);
+    if (check.verified && transaction?.provider === 'wallet' && walletFundingMap.get(String(transaction._id)) !== true) {
+      invalid.push({ subscription, reason: 'wallet-purchase-not-backed-by-prior-ledger-credits' });
+    } else if (check.verified) {
+      verified.push(subscription);
+    } else {
+      invalid.push({ subscription, reason: check.reason });
+    }
+  }
+  if (markInvalid && invalid.length) {
+    await Subscription.updateMany(
+      { _id: { $in: invalid.map((item) => item.subscription._id) }, status: 'active' },
+      { $set: { status: 'payment-failed', lastValidityCheckAt: new Date() } }
+    );
+  }
+  return { verified, invalid };
+}
+
+async function ledgerBackedWalletBalanceCents(userId) {
+  const rows = await Transaction.aggregate([
+    {
+      $match: {
+        userId: new mongoose.Types.ObjectId(String(userId)),
+        status: 'completed',
+        $or: [
+          { direction: 'credit' },
+          { direction: 'debit', provider: 'wallet' },
+          { direction: 'debit', type: 'withdrawal' },
+        ],
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        balanceCents: {
+          $sum: {
+            $cond: [{ $eq: ['$direction', 'credit'] }, '$amountCents', { $multiply: ['$amountCents', -1] }],
+          },
+        },
+      },
+    },
+  ]);
+  return Math.max(0, Number(rows[0]?.balanceCents || 0));
+}
+
 const PAYNOW_EXPRESS_METHODS = {
   ecocash: { code: 'ecocash', label: 'EcoCash', requiresPhone: true },
   onemoney: { code: 'onemoney', label: 'OneMoney', requiresPhone: true },
@@ -917,6 +1042,7 @@ const mockFantasyProvider = {
   async getGameState() {
     return {
       currentGameweek: 12,
+      nextGameweek: 13,
       syncGameweek: 12,
       nextDeadline: new Date(Date.now() + 2 * 86400000).toISOString(),
       providerAvailable: true,
@@ -987,6 +1113,7 @@ const publicFantasyProvider = {
     const syncGameweek = current?.id || lastFinished?.id || currentGameweek;
     return {
       currentGameweek,
+      nextGameweek: next?.id || current?.id || currentGameweek,
       syncGameweek,
       nextDeadline: next?.deadline_time || current?.deadline_time || null,
       providerAvailable: true,
@@ -1272,7 +1399,7 @@ async function ensureUserResources(userId) {
       {
         $setOnInsert: {
           userId,
-          availableBalanceCents: MOCK_PAYMENTS ? 5000 : 0,
+          availableBalanceCents: MOCK_FINANCIALS_ALLOWED ? 5000 : 0,
           currency: 'USD',
           lastBalanceUpdateAt: new Date(),
           lastBalanceUpdateReason: 'wallet-created',
@@ -1573,7 +1700,10 @@ async function expireSubscriptions(userId = null) {
 
 async function currentSubscription(userId) {
   await expireSubscriptions(userId);
-  return Subscription.findOne({ userId, status: 'active' }).sort({ activatedAt: -1, createdAt: -1 }).lean();
+  const candidates = await Subscription.find({ userId, status: 'active' }).sort({ activatedAt: -1, createdAt: -1 }).lean();
+  if (!candidates.length) return null;
+  const checked = await verifiedSubscriptions(candidates, { markInvalid: true });
+  return checked.verified[0] || null;
 }
 
 function parsePaynowMessage(message) {
@@ -1857,6 +1987,9 @@ async function finalizeSuccessfulPayment(transaction, paynowData) {
       if (!subscription) throw new Error('The pending subscription record could not be found.');
       const plan = resolveSubscriptionPlan(subscription.planCode);
       if (!plan) throw new Error('The subscription plan is no longer available.');
+      const expectedAmountCents = canonicalPlanAmountCents(plan);
+      if (Number(subscription.amountCents || 0) !== expectedAmountCents || Number(locked.amountCents || 0) !== expectedAmountCents) throw new Error('Subscription payment amount does not match the canonical plan price.');
+      if (locked.provider === 'mock' && !MOCK_FINANCIALS_ALLOWED) throw new Error('Mock subscription payments are not authorized to activate paid entitlements in this environment.');
       const dates = await subscriptionDates(plan);
       await Subscription.updateMany(
         { userId: locked.userId, status: 'active', _id: { $ne: subscription._id } },
@@ -1892,6 +2025,8 @@ async function finalizeSuccessfulPayment(transaction, paynowData) {
         const paidCount = await LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: 'paid' });
         if (paidCount >= league.maximumParticipants) throw new Error('The league filled before this payment could be finalised.');
         entry.paymentStatus = 'paid';
+        entry.entrySource = 'one-off';
+        entry.subscriptionId = null;
         entry.joinedAt = new Date();
         entry.paymentTransactionId = locked._id;
         entry.paymentReference = locked.reference;
@@ -3784,14 +3919,29 @@ function requireWalletIdempotencyKey(req) {
 
 async function debitWalletForPurchase({ userId, transaction, amountCents, lifetimeField }) {
   const operationReference = `${transaction.reference}:wallet-debit`;
+  if (await walletOperationApplied(userId, operationReference)) {
+    return { wallet: await Wallet.findOne({ userId }), newlyApplied: false };
+  }
+
+  const requested = Number(amountCents || 0);
+  if (!Number.isInteger(requested) || requested <= 0) return { wallet: null, newlyApplied: false, reason: 'invalid-purchase-amount' };
+  const [currentWallet, ledgerBackedCents] = await Promise.all([
+    Wallet.findOne({ userId }).lean(),
+    ledgerBackedWalletBalanceCents(userId),
+  ]);
+  const spendableBackedCents = Math.min(Number(currentWallet?.availableBalanceCents || 0), ledgerBackedCents);
+  if (spendableBackedCents < requested) {
+    return { wallet: null, newlyApplied: false, reason: 'wallet-balance-not-backed-by-completed-ledger-credits' };
+  }
+
   const wallet = await Wallet.findOneAndUpdate(
     {
       userId,
-      availableBalanceCents: { $gte: amountCents },
+      availableBalanceCents: { $gte: requested },
       appliedTransactionReferences: { $ne: operationReference },
     },
     {
-      $inc: { availableBalanceCents: -amountCents, [lifetimeField]: amountCents },
+      $inc: { availableBalanceCents: -requested, [lifetimeField]: requested },
       $addToSet: { appliedTransactionReferences: operationReference },
       $set: {
         lastBalanceUpdateAt: new Date(),
@@ -3805,7 +3955,7 @@ async function debitWalletForPurchase({ userId, transaction, amountCents, lifeti
   if (await walletOperationApplied(userId, operationReference)) {
     return { wallet: await Wallet.findOne({ userId }), newlyApplied: false };
   }
-  return { wallet: null, newlyApplied: false };
+  return { wallet: null, newlyApplied: false, reason: 'insufficient-wallet-balance' };
 }
 
 async function reverseWalletPurchase({ userId, transaction, amountCents, lifetimeField, reason }) {
@@ -3834,11 +3984,13 @@ app.post('/api/payments/wallet/subscription', requireAuth, writeLimiter, async (
   let transaction = null;
   let debited = false;
   try {
+    assertPaidCheckoutConfigured();
     if (req.body.confirmWallet !== true) return failure(res, 400, 'Confirm that you want to pay from your Supreme wallet balance.');
     const idempotencyKey = requireWalletIdempotencyKey(req);
     const requestedPlanCode = normalizeSubscriptionPlanCode(req.body.planCode);
     const plan = resolveSubscriptionPlan(requestedPlanCode);
     if (!plan) return failure(res, 400, 'Unknown subscription plan.');
+    canonicalPlanAmountCents(plan);
 
     const existing = await Transaction.findOne({ userId: req.user._id, type: 'subscription', 'metadata.idempotencyKey': idempotencyKey });
     if (existing) {
@@ -3918,7 +4070,7 @@ app.post('/api/payments/wallet/subscription', requireAuth, writeLimiter, async (
         $set: { status: 'rejected', 'metadata.failureReason': 'Insufficient wallet balance', 'metadata.finalizedAt': new Date() },
       }, { new: true });
       await emailService.notifyPaymentUpdate(transaction);
-      return failure(res, 400, 'Your wallet balance is not enough for this subscription. Deposit with Paynow or choose Paynow at checkout.');
+      return failure(res, 400, debit.reason === 'wallet-balance-not-backed-by-completed-ledger-credits' ? 'Your wallet contains an unverified/demo balance that cannot be used for paid subscriptions. Use a balance funded by completed deposits, prizes, bonuses or refunds.' : 'Your wallet balance is not enough for this subscription. Deposit with Paynow or choose Paynow at checkout.');
     }
     debited = true;
 
@@ -4015,6 +4167,7 @@ app.post('/api/payments/wallet/league-entry', requireAuth, writeLimiter, async (
   let debited = false;
   let entry = null;
   try {
+    assertPaidCheckoutConfigured();
     if (req.body.confirmWallet !== true) return failure(res, 400, 'Confirm that you want to pay from your Supreme wallet balance.');
     const idempotencyKey = requireWalletIdempotencyKey(req);
     if (!mongoose.isValidObjectId(req.body.leagueId)) return failure(res, 404, 'League not found.');
@@ -4082,6 +4235,7 @@ app.post('/api/payments/wallet/league-entry', requireAuth, writeLimiter, async (
         userId: req.user._id,
         fantasyManagerId: req.user.fplManagerId,
         paymentStatus: 'pending',
+        entrySource: 'one-off',
         currentScore: 0,
         currentRank: 0,
         previousRank: 0,
@@ -4134,7 +4288,7 @@ app.post('/api/payments/wallet/league-entry', requireAuth, writeLimiter, async (
       }, { new: true });
       await LeagueEntry.updateOne({ _id: entry._id, paymentStatus: { $ne: 'paid' } }, { $set: { paymentStatus: 'failed' } });
       await emailService.notifyPaymentUpdate(transaction);
-      return failure(res, 400, 'Your wallet balance is not enough for this league entry. Deposit with Paynow or choose Paynow at checkout.');
+      return failure(res, 400, debit.reason === 'wallet-balance-not-backed-by-completed-ledger-credits' ? 'Your wallet contains an unverified/demo balance that cannot be used for paid league entries. Use a balance funded by completed deposits, prizes, bonuses or refunds.' : 'Your wallet balance is not enough for this league entry. Deposit with Paynow or choose Paynow at checkout.');
     }
     debited = true;
 
@@ -4298,7 +4452,7 @@ async function reconcileProcessingWalletPurchases() {
         const paidCountBefore = await LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: 'paid', _id: { $ne: entry._id } });
         await LeagueEntry.updateOne(
           { _id: entry._id },
-          { $set: { paymentStatus: 'paid', joinedAt: entry.joinedAt || new Date(), paymentTransactionId: transaction._id, paymentReference: transaction.reference, paymentMethod: 'Supreme wallet', currentRank: entry.currentRank || paidCountBefore + 1, previousRank: entry.previousRank || paidCountBefore + 1 } }
+          { $set: { paymentStatus: 'paid', entrySource: 'one-off', subscriptionId: null, joinedAt: entry.joinedAt || new Date(), paymentTransactionId: transaction._id, paymentReference: transaction.reference, paymentMethod: 'Supreme wallet', currentRank: entry.currentRank || paidCountBefore + 1, previousRank: entry.previousRank || paidCountBefore + 1 } }
         );
         const paidCount = paidCountBefore + 1;
         if (league.competitionType === 'band-for-band') league.status = paidCount >= 2 ? 'live' : 'upcoming';
@@ -4366,6 +4520,9 @@ async function reconcileProcessingWalletPurchases() {
 }
 
 async function createPaynowPaymentRecord({ req, type, amountCents, method, phone, plan = null, league = null, leagueEntry = null }) {
+  if (['subscription', 'entry-fee'].includes(type)) assertPaidCheckoutConfigured();
+  if (!Number.isInteger(Number(amountCents)) || Number(amountCents) <= 0) { const error = new Error('Paid checkout amount must be greater than zero.'); error.status = 500; throw error; }
+  if (type === 'subscription') canonicalPlanAmountCents(plan);
   const idempotencyKey = String(req.headers['idempotency-key'] || '').trim();
   if (idempotencyKey) {
     const existing = await Transaction.findOne({ userId: req.user._id, type, 'metadata.idempotencyKey': idempotencyKey });
@@ -4534,6 +4691,7 @@ app.post('/api/payments/paynow/league-entry', requireAuth, writeLimiter, async (
         userId: req.user._id,
         fantasyManagerId: req.user.fplManagerId,
         paymentStatus: 'pending',
+        entrySource: 'one-off',
         currentScore: 0,
         currentRank: 0,
         previousRank: 0,
@@ -4541,6 +4699,8 @@ app.post('/api/payments/paynow/league-entry', requireAuth, writeLimiter, async (
     } else {
       entry.fantasyManagerId = req.user.fplManagerId;
       entry.paymentStatus = 'pending';
+      entry.entrySource = 'one-off';
+      entry.subscriptionId = null;
       await entry.save();
     }
 
@@ -4585,6 +4745,7 @@ app.post('/api/payments/paynow/subscription', requireAuth, writeLimiter, async (
         accepted: Object.values(PLANS).map((item) => item.planCode),
       }]);
     }
+    canonicalPlanAmountCents(plan);
     if (!PAYNOW_EXPRESS_METHODS[req.body.method]) return failure(res, 400, 'Select a supported Paynow Express Checkout method.');
     const transaction = await createPaynowPaymentRecord({ req, type: 'subscription', amountCents: plan.amountCents, method: req.body.method, phone: req.body.phone, plan });
     return success(res, { payment: paymentPublicView(transaction), wallet: walletClientView(await Wallet.findOne({ userId: req.user._id })), demoWarning: MOCK_PAYMENTS ? 'Mock Paynow checkout completed. No real payment was processed.' : '' }, 201);
@@ -4647,7 +4808,9 @@ app.post('/api/withdrawals/request', requireAuth, writeLimiter, async (req, res,
     if (!PAYMENT_METHODS.includes(method)) return failure(res, 400, 'Select a supported withdrawal method.');
     if (req.body.currency && String(req.body.currency).toUpperCase() !== 'USD') return failure(res, 400, 'Withdrawals are paid only to USD accounts.');
 
-    const destination = { method, currency: 'USD' };
+    const accountName = String(req.body.accountName || '').trim().replace(/\s+/g, ' ');
+    if (accountName.length < 2 || accountName.length > 100) return failure(res, 400, 'Enter the account holder name registered for this payout destination.');
+    const destination = { method, currency: 'USD', accountName };
     if (method === 'Bank Transfer') {
       const bankName = String(req.body.bankName || '').trim();
       const branchNumber = String(req.body.branchNumber || '').replace(/\s+/g, '');
@@ -7083,7 +7246,7 @@ const localGrowth = (() => {
       }
 
       async function activeSubscriptionsForUsers(userIds, now = new Date()) {
-        return Subscription.find({
+        const candidates = await Subscription.find({
           ...(userIds?.length ? { userId: { $in: userIds } } : {}),
           status: 'active',
           $or: [
@@ -7092,6 +7255,58 @@ const localGrowth = (() => {
             { endDate: null, validUntil: null },
           ],
         }).lean();
+        const checked = await verifiedSubscriptions(candidates, { markInvalid: true });
+        return checked.verified;
+      }
+
+      async function reconcileUnverifiedSubscriptionEntitlements({ apply = true } = {}) {
+        const now = new Date();
+        const activeCandidates = await Subscription.find({ status: 'active' }).lean();
+        const checked = await verifiedSubscriptions(activeCandidates, { markInvalid: apply });
+        const verifiedByUser = new Map();
+        for (const sub of checked.verified) {
+          const key = String(sub.userId);
+          if (!verifiedByUser.has(key)) verifiedByUser.set(key, []);
+          verifiedByUser.get(key).push(sub);
+        }
+
+        const metas = await SupremeLeagueMeta.find({ settlementStatus: 'open' }).lean();
+        const metaByLeague = new Map(metas.map((meta) => [String(meta.leagueId), meta]));
+        const candidates = metas.length ? await LeagueEntry.find({
+          leagueId: { $in: metas.map((meta) => meta.leagueId) },
+          paymentStatus: 'paid',
+          paymentTransactionId: null,
+          $or: [
+            { entrySource: 'subscription' },
+            { eligibilityReason: { $regex: /included with .*subscription/i } },
+          ],
+        }).lean() : [];
+
+        const invalidEntries = [];
+        for (const entry of candidates) {
+          const meta = metaByLeague.get(String(entry.leagueId));
+          if (!meta || meta.entryMode === 'free-all') continue;
+          const validSubscription = (verifiedByUser.get(String(entry.userId)) || []).find((subscription) => subscriptionEntitles(subscription, meta.cadence, meta));
+          if (!validSubscription) invalidEntries.push(entry);
+          else if (apply && (!entry.subscriptionId || entry.entrySource !== 'subscription')) {
+            await LeagueEntry.updateOne({ _id: entry._id }, { $set: { subscriptionId: validSubscription._id, entrySource: 'subscription', eligibilityReason: 'Included with verified paid subscription' } });
+          }
+        }
+
+        if (apply && invalidEntries.length) {
+          await LeagueEntry.deleteMany({ _id: { $in: invalidEntries.map((entry) => entry._id) } });
+        }
+
+        return {
+          activeSubscriptionsChecked: activeCandidates.length,
+          verifiedSubscriptions: checked.verified.length,
+          invalidSubscriptions: checked.invalid.map((item) => ({ subscriptionId: String(item.subscription._id), userId: String(item.subscription.userId), planCode: item.subscription.planCode, amountCents: item.subscription.amountCents, reason: item.reason })),
+          subscriptionEntriesChecked: candidates.length,
+          invalidEntries: invalidEntries.map((entry) => ({ entryId: String(entry._id), leagueId: String(entry.leagueId), userId: String(entry.userId), reason: 'No verified paid subscription entitles this entry' })),
+          removedEntries: apply ? invalidEntries.length : 0,
+          applied: apply,
+          checkedAt: now,
+        };
       }
 
       async function enrollSubscribersInSupremeLeagues({ userId = null } = {}) {
@@ -7116,8 +7331,8 @@ const localGrowth = (() => {
         for (const meta of metas) {
           for (const user of users) {
             const isFreeForAll = meta.entryMode === 'free-all';
-            const includedBySubscription = (subscriptionsByUser.get(String(user._id)) || []).some((sub) => subscriptionEntitles(sub, meta.cadence, meta));
-            if (!isFreeForAll && !includedBySubscription) continue;
+            const matchingSubscription = (subscriptionsByUser.get(String(user._id)) || []).find((sub) => subscriptionEntitles(sub, meta.cadence, meta)) || null;
+            if (!isFreeForAll && !matchingSubscription) continue;
             const exists = await LeagueEntry.exists({ leagueId: meta.leagueId, userId: user._id });
             if (exists) continue;
             await LeagueEntry.create({
@@ -7126,8 +7341,10 @@ const localGrowth = (() => {
               fantasyManagerId: user.fplManagerId,
               joinedAt: new Date(),
               paymentStatus: 'paid',
+              entrySource: isFreeForAll ? 'free' : 'subscription',
+              subscriptionId: matchingSubscription?._id || null,
               eligibilityStatus: 'eligible',
-              eligibilityReason: isFreeForAll ? 'Free Clash of the Captains entry' : 'Included with active subscription',
+              eligibilityReason: isFreeForAll ? 'Free Clash of the Captains entry' : 'Included with verified paid subscription',
               currentScore: 0,
               currentRank: null,
               previousRank: null,
@@ -7451,6 +7668,7 @@ const localGrowth = (() => {
           result.supremeSettlement = { settled: 0, skipped: true };
           return result;
         }
+        result.financialEntitlements = await reconcileUnverifiedSubscriptionEntitlements({ apply: true });
         result.supremeCreated = await ensureSupremeLeagues();
         result.supremeEnrollment = await enrollSubscribersInSupremeLeagues();
         result.supremeSettlement = await settleFinishedSupremeLeagues();
@@ -7613,6 +7831,7 @@ const localGrowth = (() => {
         assertLeagueJoinAllowed,
         notifySupportTicketReceived,
         ensureSupremeLeagues,
+        reconcileUnverifiedSubscriptionEntitlements,
         enrollSubscribersInSupremeLeagues,
         enrollUserInOpenSupremeLeagues,
         settleFinishedSupremeLeagues,
@@ -8021,4 +8240,8 @@ module.exports.connectDatabase = connectDatabase;
 module.exports.runGrowthMaintenance = async function runGrowthMaintenance() {
   await prepareRuntime();
   return localGrowth.runMaintenance();
+};
+module.exports.auditFinancialEntitlements = async function auditFinancialEntitlements(options = {}) {
+  await prepareRuntime();
+  return localGrowth.reconcileUnverifiedSubscriptionEntitlements({ apply: options.apply === true });
 };
