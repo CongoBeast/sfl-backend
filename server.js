@@ -587,6 +587,13 @@ const subscriptionSchema = new Schema({
   cancelledAt: { type: Date, default: null },
   cancelledBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
   cancellationReason: { type: String, default: '' },
+  // Populated when an admin force-ends a subscription that ran past where it
+  // should have (e.g. a reconciliation lag), without treating it as a
+  // refunded cancellation. Kept separate from cancelledAt/cancelledBy/
+  // cancellationReason so the two admin actions stay distinguishable in history.
+  endedAt: { type: Date, default: null },
+  endedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+  endReason: { type: String, default: '' },
   autoRenew: { type: Boolean, default: false },
   paymentTransactionId: { type: Schema.Types.ObjectId, ref: 'Transaction', default: null },
   paymentReference: { type: String, default: '' },
@@ -1478,9 +1485,16 @@ function monthlySubscriptionWindowFromBootstrap(startDate, bootstrap) {
     return deadline.getUTCFullYear() === targetYear && deadline.getUTCMonth() === targetMonth;
   });
 
-  // During an off-season month with no FPL deadline, sell access to the next
-  // scheduled FPL month rather than creating an arbitrary 30-day entitlement.
-  if (!cycleEvents.length) {
+  // During an off-season month with no FPL deadline, OR when every gameweek
+  // deadline that fell in this calendar month has already passed (e.g. a member
+  // re-subscribing in the last day(s) of the month, after that month's final GW
+  // deadline), sell access to the next scheduled FPL month rather than anchoring
+  // to a month that has nothing left to play. Without this, a renewal purchased
+  // right before the new gameweek starts would be stamped with the finishing
+  // month's cycle key and would NOT entitle the member to the very next
+  // gameweek's Monthly League — the whole reason they are subscribing "now".
+  const cycleEventsAllPast = cycleEvents.length > 0 && cycleEvents.every((event) => new Date(event.deadline_time) <= anchor);
+  if (!cycleEvents.length || cycleEventsAllPast) {
     const nextEvent = events.find((event) => new Date(event.deadline_time) >= anchor);
     if (!nextEvent) throw new Error('No future FPL gameweek is available for a monthly subscription.');
     const nextDeadline = new Date(nextEvent.deadline_time);
@@ -1565,6 +1579,26 @@ async function subscriptionDates(plan, startDate = new Date()) {
     // fixture deadline once the provider recovers.
     console.warn('Monthly subscription schedule fallback used:', error.message);
     return calendarFallback;
+  }
+}
+
+// Whether buying the member's current plan again right now would land in the
+// same monthly cycle they're already on. Used by the Subscription page to
+// decide whether the "Current plan" button should stay disabled: a monthly
+// subscription can still show status 'active' while its cycle key is for a
+// month whose gameweeks are already finishing, in which case the member
+// needs to be able to re-subscribe for the upcoming cycle before its deadline.
+async function subscriptionCoversCurrentCycle(subscription) {
+  if (!subscription) return true;
+  const plan = resolveSubscriptionPlan(subscription.planCode);
+  if (!plan || plan.billingInterval !== 'monthly') return true;
+  try {
+    const freshWindow = await subscriptionDates(plan);
+    return String(freshWindow.monthlyCycleKey || '') === String(subscription.monthlyCycleKey || '');
+  } catch (error) {
+    // Fail safe to the old behaviour (treat as still current) rather than
+    // surfacing an error on the subscription page over this derived field.
+    return true;
   }
 }
 
@@ -4858,8 +4892,11 @@ app.get('/api/subscription', requireAuth, async (req, res, next) => {
       ensureUserResources(req.user._id),
       Subscription.find({ userId: req.user._id }).sort({ createdAt: -1 }).lean(),
     ]);
+    const subscriptionPayload = subscription
+      ? { ...subscription, coversCurrentCycle: await subscriptionCoversCurrentCycle(subscription) }
+      : null;
     return success(res, {
-      subscription,
+      subscription: subscriptionPayload,
       wallet: walletClientView(resources.wallet),
       history,
       plans: Object.values(PLANS),
@@ -4963,10 +5000,39 @@ function cachedDashboardGameState(team, offers) {
   const gameweek = Number(team?.snapshot?.gameweek || next?.startGameweek || 0);
   return {
     currentGameweek: gameweek,
+    // team.snapshot.gameweek is the last gameweek a team snapshot was synced
+    // for, which lags behind as soon as a new gameweek opens. next?.startGameweek
+    // (the soonest joinable Supreme league) is the correct "what's coming up"
+    // number, so it — not the stale snapshot value — is what the countdown label
+    // should show.
+    nextGameweek: Number(next?.startGameweek || gameweek || 0),
     syncGameweek: gameweek,
     nextDeadline: next?.joinDeadlineAt || null,
     source: 'cached-platform-data',
   };
+}
+
+// Checks the FPL bootstrap directly (fantasyProvider.getGameState(), backed by
+// a 5-minute cache) for the true current/next gameweek instead of inferring it
+// from the member's own last-synced team snapshot or league join-deadline
+// ordering, either of which can lag by a gameweek. Falls back to the cached
+// derivation above if the provider is unavailable so the dashboard still loads.
+async function dashboardGameState(team, offers) {
+  try {
+    const live = await fantasyProvider.getGameState();
+    if (live && (live.currentGameweek || live.nextGameweek)) {
+      return {
+        currentGameweek: Number(live.currentGameweek || 0),
+        nextGameweek: Number(live.nextGameweek || live.currentGameweek || 0),
+        syncGameweek: Number(live.syncGameweek || live.currentGameweek || 0),
+        nextDeadline: live.nextDeadline || null,
+        source: live.providerMode === 'mock' ? 'mock-platform-data' : 'live-fpl-data',
+      };
+    }
+  } catch (error) {
+    console.warn('Dashboard game state: live FPL lookup failed, using cached fallback:', error.message);
+  }
+  return cachedDashboardGameState(team, offers);
 }
 
 app.get('/api/leaderboards', requireAuth, async (req, res, next) => {
@@ -5015,7 +5081,7 @@ app.get('/api/dashboard', requireAuth, async (req, res, next) => {
       subscription: subscription?.planName || 'No active plan',
     };
     return success(res, {
-      gameState: cachedDashboardGameState(team, availableCompetitions),
+      gameState: await dashboardGameState(team, availableCompetitions),
       summary,
       myLeagues,
       team,
@@ -5679,6 +5745,43 @@ app.post('/api/admin/subscriptions/:id/cancel-refund', requireAdmin, writeLimite
 
     const wallet = await Wallet.findOne({ userId: subscription.userId }).lean();
     return success(res, { subscription: subscription.toObject(), wallet, transaction });
+  } catch (error) { next(error); }
+});
+
+// Force-ends a subscription immediately without a refund and without marking
+// it 'cancelled' — for a subscription that ran past where it should have
+// (e.g. a reconciliation lag or an admin correction) rather than one being
+// refunded for joining too late. No wallet transaction is created and no
+// cancellation email is sent.
+app.post('/api/admin/subscriptions/:id/end', requireAdmin, writeLimiter, async (req, res, next) => {
+  try {
+    const subscription = await Subscription.findById(req.params.id);
+    if (!subscription) return failure(res, 404, 'Subscription not found.');
+    if (['expired', 'cancelled', 'replaced'].includes(subscription.status)) {
+      return failure(res, 409, `This subscription is already ${subscription.status} and cannot be ended again.`);
+    }
+
+    const reason = String(req.body.reason || '').trim().slice(0, 500);
+    if (!reason) return failure(res, 400, 'Provide a reason for ending this subscription.');
+
+    const previousValidUntil = subscription.validUntil;
+    const now = new Date();
+    subscription.status = 'expired';
+    subscription.endDate = now;
+    subscription.validUntil = now;
+    subscription.lastValidityCheckAt = now;
+    subscription.endedAt = now;
+    subscription.endedBy = req.user._id;
+    subscription.endReason = reason;
+    await subscription.save();
+
+    await adminAudit(req, 'subscription.ended', 'Subscription', subscription._id, {
+      reason,
+      userId: String(subscription.userId),
+      previousValidUntil,
+    });
+
+    return success(res, { subscription: subscription.toObject() });
   } catch (error) { next(error); }
 });
 
