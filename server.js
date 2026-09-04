@@ -895,10 +895,19 @@ async function ledgerBackedWalletBalanceCents(userId) {
       $match: {
         userId: new mongoose.Types.ObjectId(String(userId)),
         status: 'completed',
+        // Withdrawals are deliberately excluded here. A withdrawal's debit is
+        // applied to availableBalanceCents the moment it's REQUESTED (moved
+        // into pendingBalanceCents — see /api/withdrawals/request), while its
+        // Transaction row stays 'pending' until an admin later marks it
+        // 'completed'. If a completed withdrawal were matched here, its
+        // amount would be subtracted from this reconstruction a second time —
+        // once already baked into the real availableBalanceCents, and again
+        // here — permanently understating every subsequent purchase check for
+        // any member who has ever completed a withdrawal, even though their
+        // real available balance is unaffected by that second subtraction.
         $or: [
           { direction: 'credit' },
           { direction: 'debit', provider: 'wallet' },
-          { direction: 'debit', type: 'withdrawal' },
         ],
       },
     },
