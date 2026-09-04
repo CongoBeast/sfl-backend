@@ -2408,6 +2408,47 @@ async function leagueView(league, userId = null) {
   };
 }
 
+// Marks a member's entry into a $0 league as paid directly — no Transaction,
+// no wallet debit, no Paynow prompt. A free league (e.g. Clash of the
+// Captains, entryFeeCents === 0) has nothing to charge, so it must never be
+// routed through the payment gateway: debitWalletForPurchase() treats any
+// non-positive amount as an invalid purchase and surfaces a misleading
+// "wallet balance is not enough" error for an entry that was never supposed
+// to cost anything.
+async function joinFreeLeagueEntry({ league, userId, fplManagerId, existingEntry = null }) {
+  const paidCountBefore = await LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: 'paid' });
+  const update = {
+    fantasyManagerId: fplManagerId,
+    paymentStatus: 'paid',
+    entrySource: 'free',
+    subscriptionId: null,
+    joinedAt: new Date(),
+    eligibilityStatus: 'eligible',
+    eligibilityReason: 'Free league entry',
+    currentRank: paidCountBefore + 1,
+    previousRank: paidCountBefore + 1,
+  };
+  const entry = existingEntry
+    ? await LeagueEntry.findByIdAndUpdate(existingEntry._id, { $set: update }, { new: true })
+    : await LeagueEntry.create({
+        leagueId: league._id,
+        userId,
+        currentScore: 0,
+        prizeCents: 0,
+        payoutStatus: 'not-applicable',
+        ...update,
+      });
+
+  const paidCount = paidCountBefore + 1;
+  if (league.competitionType === 'band-for-band') league.status = paidCount >= 2 ? 'live' : 'upcoming';
+  else if (paidCount >= league.maximumParticipants) league.status = 'full';
+  else if (league.status === 'draft') league.status = 'open';
+  await league.save();
+
+  await emailService.notifyLeagueMembership(userId, league._id, 'Free entry');
+  return entry;
+}
+
 // -----------------------------------------------------------------------------
 // Public endpoints
 // -----------------------------------------------------------------------------
@@ -3686,8 +3727,35 @@ app.get('/api/leagues/:leagueId', requireAuth, async (req, res, next) => {
 });
 
 // Legacy route is deliberately non-financial. All wallet spending now requires the explicit checkout confirmation flow.
-app.post('/api/leagues/:leagueId/join', requireAuth, writeLimiter, async (req, res) => {
-  return failure(res, 409, 'Choose Wallet balance or Paynow in the league checkout. Wallet deductions require an explicit confirmation.');
+app.post('/api/leagues/:leagueId/join', requireAuth, writeLimiter, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.leagueId)) return failure(res, 404, 'League not found.');
+    const league = await League.findById(req.params.leagueId);
+    if (!league || league.status === 'cancelled') return failure(res, 404, 'League not found.');
+
+    // Any league with an entry fee still goes through the wallet/Paynow
+    // checkout, which requires an explicit wallet-deduction confirmation.
+    if (Number(league.entryFeeCents || 0) > 0) {
+      return failure(res, 409, 'Choose Wallet balance or Paynow in the league checkout. Wallet deductions require an explicit confirmation.');
+    }
+
+    // Free league (entryFeeCents === 0, e.g. Clash of the Captains) — join
+    // directly. No payment gateway involved.
+    if (!req.user.fplManagerId) return failure(res, 400, 'Link your fantasy manager ID before joining a league.');
+    if (leagueIsPast(league)) return failure(res, 400, 'This league has closed and can no longer accept new members.');
+    if (!['open', 'upcoming', 'live'].includes(league.status)) return failure(res, 400, 'This league is not open for new members.');
+
+    const entry = await LeagueEntry.findOne({ leagueId: league._id, userId: req.user._id });
+    if (entry?.paymentStatus === 'paid') {
+      return success(res, { league: await leagueView(league, req.user._id), message: 'You have already joined this league.' });
+    }
+
+    const reservedCount = await LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: { $in: ['paid', 'pending'] } });
+    if (reservedCount >= league.maximumParticipants) return failure(res, 400, 'This league is full.');
+
+    await joinFreeLeagueEntry({ league, userId: req.user._id, fplManagerId: req.user.fplManagerId, existingEntry: entry });
+    return success(res, { league: await leagueView(league, req.user._id), message: 'You have joined this free league.' }, 201);
+  } catch (error) { next(error); }
 });
 
 function leaderboardChipLabel(chip) {
@@ -4231,6 +4299,18 @@ app.post('/api/payments/wallet/league-entry', requireAuth, writeLimiter, async (
       return failure(res, 400, 'This league entry can no longer be paid.');
     }
 
+    // Free league — nothing to charge, so skip the wallet gateway entirely
+    // rather than letting debitWalletForPurchase() reject a $0 amount as
+    // "insufficient balance".
+    if (Number(league.entryFeeCents || 0) <= 0) {
+      const existingFreeEntry = await LeagueEntry.findOne({ leagueId: league._id, userId: req.user._id });
+      if (existingFreeEntry?.paymentStatus === 'paid') return failure(res, 409, 'You have already joined this league.');
+      const reservedFreeCount = await LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: { $in: ['paid', 'pending'] } });
+      if (reservedFreeCount >= league.maximumParticipants) return failure(res, 400, 'This league is full.');
+      await joinFreeLeagueEntry({ league, userId: req.user._id, fplManagerId: req.user.fplManagerId, existingEntry: existingFreeEntry });
+      return success(res, { wallet: walletClientView(await Wallet.findOne({ userId: req.user._id })), league: await leagueView(league, req.user._id), message: 'You have joined this free league. No payment was required.' }, 201);
+    }
+
     const existing = await Transaction.findOne({ userId: req.user._id, type: 'entry-fee', 'metadata.idempotencyKey': idempotencyKey });
     if (existing) {
       if (existing.provider !== 'wallet') return failure(res, 409, 'This checkout reference already belongs to a Paynow payment. Close the checkout and start a new wallet payment.');
@@ -4721,6 +4801,17 @@ app.post('/api/payments/paynow/league-entry', requireAuth, writeLimiter, async (
       }
     } else if (!['draft', 'open', 'upcoming'].includes(league.status)) {
       return failure(res, 400, 'This league entry can no longer be paid.');
+    }
+
+    // Free league — nothing to charge, so skip Paynow entirely rather than
+    // starting a $0 mobile-money checkout.
+    if (Number(league.entryFeeCents || 0) <= 0) {
+      const existingFreeEntry = await LeagueEntry.findOne({ leagueId: league._id, userId: req.user._id });
+      if (existingFreeEntry?.paymentStatus === 'paid') return failure(res, 409, 'You have already joined this league.');
+      const reservedFreeCount = await LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: { $in: ['paid', 'pending'] } });
+      if (reservedFreeCount >= league.maximumParticipants) return failure(res, 400, 'This league is full.');
+      await joinFreeLeagueEntry({ league, userId: req.user._id, fplManagerId: req.user.fplManagerId, existingEntry: existingFreeEntry });
+      return success(res, { wallet: walletClientView(await Wallet.findOne({ userId: req.user._id })), league: await leagueView(league, req.user._id), message: 'You have joined this free league. No payment was required.' }, 201);
     }
 
     let entry = await LeagueEntry.findOne({ leagueId: league._id, userId: req.user._id });
