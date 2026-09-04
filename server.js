@@ -2332,14 +2332,30 @@ async function getEarningsLeaderboard(currentUserId, limit = 10) {
   }));
 }
 
+// Whether a league is genuinely free-for-everyone (currently only Clash of
+// the Captains). This is NOT the same as entryFeeCents === 0: Bi-weekly,
+// Monthly, Half-season and Season Supreme leagues also default to
+// entryFeeCents 0 (they simply have no one-off cash price — they're
+// subscription-gated instead), so entryFeeCents alone cannot be used to
+// decide this. The authoritative signal is SupremeLeagueMeta.entryMode,
+// which is 'free-all' only for Clash of the Captains.
+async function isFreeForAllLeague(league) {
+  if (!league?.officialSupremeLeague) return false;
+  const SupremeLeagueMetaModel = mongoose.models.SupremeLeagueMeta;
+  if (!SupremeLeagueMetaModel) return false;
+  const meta = await SupremeLeagueMetaModel.findOne({ leagueId: league._id }).select('entryMode').lean();
+  return meta?.entryMode === 'free-all';
+}
+
 async function leagueView(league, userId = null) {
   // Keep list/detail reads DB-only and parallel. Live FPL work is deliberately
   // handled by the page's automatic refresh request after cached content renders.
-  const [participantCount, reservedCount, entry, accessPolicy] = await Promise.all([
+  const [participantCount, reservedCount, entry, accessPolicy, freeEntry] = await Promise.all([
     LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: 'paid' }),
     LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: { $in: ['paid', 'pending'] } }),
     userId ? LeagueEntry.findOne({ leagueId: league._id, userId }).lean() : Promise.resolve(null),
     localGrowth.getLeagueAccessPolicy(league._id),
+    isFreeForAllLeague(league),
   ]);
   const grossPoolCents = participantCount * league.entryFeeCents;
   const platformFeeCents = league.customLeague ? Math.round(grossPoolCents * league.platformFeeBasisPoints / 10000) : 0;
@@ -2376,6 +2392,7 @@ async function leagueView(league, userId = null) {
     endGameweek: league.endGameweek,
     currentGameweek: league.currentGameweek,
     entryFeeCents: league.entryFeeCents,
+    freeEntry,
     participantCount,
     reservedCount,
     grossPoolCents,
@@ -3735,11 +3752,17 @@ app.post('/api/leagues/:leagueId/join', requireAuth, writeLimiter, async (req, r
 
     // Any league with an entry fee still goes through the wallet/Paynow
     // checkout, which requires an explicit wallet-deduction confirmation.
-    if (Number(league.entryFeeCents || 0) > 0) {
+    // NOTE: this must check entryMode via isFreeForAllLeague(), not
+    // entryFeeCents directly — Bi-weekly/Monthly/Half-season/Season Supreme
+    // leagues also default entryFeeCents to 0 (they simply have no one-off
+    // cash price; they're subscription-gated), so entryFeeCents === 0 does
+    // NOT mean "free for everyone" the way it does for Clash of the Captains.
+    const freeForAll = await isFreeForAllLeague(league);
+    if (!freeForAll) {
       return failure(res, 409, 'Choose Wallet balance or Paynow in the league checkout. Wallet deductions require an explicit confirmation.');
     }
 
-    // Free league (entryFeeCents === 0, e.g. Clash of the Captains) — join
+    // Free-for-all league (currently only Clash of the Captains) — join
     // directly. No payment gateway involved.
     if (!req.user.fplManagerId) return failure(res, 400, 'Link your fantasy manager ID before joining a league.');
     if (leagueIsPast(league)) return failure(res, 400, 'This league has closed and can no longer accept new members.');
@@ -4299,10 +4322,13 @@ app.post('/api/payments/wallet/league-entry', requireAuth, writeLimiter, async (
       return failure(res, 400, 'This league entry can no longer be paid.');
     }
 
-    // Free league — nothing to charge, so skip the wallet gateway entirely
-    // rather than letting debitWalletForPurchase() reject a $0 amount as
-    // "insufficient balance".
-    if (Number(league.entryFeeCents || 0) <= 0) {
+    // Free-for-all league (currently only Clash of the Captains) — nothing to
+    // charge, so skip the wallet gateway entirely rather than letting
+    // debitWalletForPurchase() reject a $0 amount as "insufficient balance".
+    // This must check entryMode via isFreeForAllLeague(), not entryFeeCents —
+    // several subscription-gated Supreme leagues also default entryFeeCents
+    // to 0 without being free for everyone.
+    if (await isFreeForAllLeague(league)) {
       const existingFreeEntry = await LeagueEntry.findOne({ leagueId: league._id, userId: req.user._id });
       if (existingFreeEntry?.paymentStatus === 'paid') return failure(res, 409, 'You have already joined this league.');
       const reservedFreeCount = await LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: { $in: ['paid', 'pending'] } });
@@ -4803,9 +4829,11 @@ app.post('/api/payments/paynow/league-entry', requireAuth, writeLimiter, async (
       return failure(res, 400, 'This league entry can no longer be paid.');
     }
 
-    // Free league — nothing to charge, so skip Paynow entirely rather than
-    // starting a $0 mobile-money checkout.
-    if (Number(league.entryFeeCents || 0) <= 0) {
+    // Free-for-all league (currently only Clash of the Captains) — nothing to
+    // charge, so skip Paynow entirely rather than starting a $0 mobile-money
+    // checkout. Must check entryMode via isFreeForAllLeague(), not
+    // entryFeeCents — see the note in the wallet league-entry route above.
+    if (await isFreeForAllLeague(league)) {
       const existingFreeEntry = await LeagueEntry.findOne({ leagueId: league._id, userId: req.user._id });
       if (existingFreeEntry?.paymentStatus === 'paid') return failure(res, 409, 'You have already joined this league.');
       const reservedFreeCount = await LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: { $in: ['paid', 'pending'] } });
