@@ -3266,78 +3266,97 @@ async function syncLeagueScores(leagueId, { force = false } = {}) {
   league.scoreSyncMessage = '';
   await league.save();
 
-  const gameState = await fantasyProvider.getGameState();
-  const scoreThroughGameweek = Math.max(
-    Number(league.startGameweek),
-    Math.min(Number(league.endGameweek), Number(gameState.syncGameweek || gameState.currentGameweek || league.currentGameweek))
-  );
-  const entries = await LeagueEntry.find({ leagueId: league._id, paymentStatus: 'paid' })
-    .populate('userId', 'fullName fplManagerId')
-    .sort({ joinedAt: 1 });
+  // Everything from here on is wrapped: if fantasyProvider.getGameState() or
+  // anything else throws before the loop finishes, the league was previously
+  // left stuck at scoreSyncStatus:'syncing' forever (it's only ever reset to
+  // success/partial/failed at the very end of this function). Since the
+  // freshness check above only looks at lastScoredAt — which also never gets
+  // updated on that path — a transient provider error here could make scores
+  // look permanently frozen instead of self-healing or at least surfacing a
+  // visible failure.
+  try {
+    const gameState = await fantasyProvider.getGameState();
+    const scoreThroughGameweek = Math.max(
+      Number(league.startGameweek),
+      Math.min(Number(league.endGameweek), Number(gameState.syncGameweek || gameState.currentGameweek || league.currentGameweek))
+    );
+    const entries = await LeagueEntry.find({ leagueId: league._id, paymentStatus: 'paid' })
+      .populate('userId', 'fullName fplManagerId')
+      .sort({ joinedAt: 1 });
 
-  let synced = 0;
-  let failed = 0;
-  const failures = [];
+    let synced = 0;
+    let failed = 0;
+    const failures = [];
 
-  for (const entry of entries) {
-    const managerId = String(entry.fantasyManagerId || entry.userId?.fplManagerId || '').trim();
-    entry.previousRank = entry.currentRank || 0;
-    if (!managerId) {
-      entry.scoreSyncStatus = 'failed';
-      entry.scoreSyncError = 'No FPL manager ID is stored for this league member.';
-      entry.lastScoreSyncAt = new Date();
-      await entry.save();
-      failed += 1;
-      failures.push(`${entry.userId?.fullName || 'Member'}: missing manager ID`);
-      continue;
+    for (const entry of entries) {
+      const managerId = String(entry.fantasyManagerId || entry.userId?.fplManagerId || '').trim();
+      entry.previousRank = entry.currentRank || 0;
+      if (!managerId) {
+        entry.scoreSyncStatus = 'failed';
+        entry.scoreSyncError = 'No FPL manager ID is stored for this league member.';
+        entry.lastScoreSyncAt = new Date();
+        await entry.save();
+        failed += 1;
+        failures.push(`${entry.userId?.fullName || 'Member'}: missing manager ID`);
+        continue;
+      }
+
+      try {
+        if (!entry.fantasyManagerId) entry.fantasyManagerId = managerId;
+        const scoreResult = await scoreManagerForLeague(managerId, league, scoreThroughGameweek);
+        entry.currentScore = scoreResult.score;
+        entry.scoreThroughGameweek = scoreThroughGameweek;
+        entry.latestOverallRank = scoreResult.latestOverallRank;
+        entry.scoreDetails = scoreResult.details || {};
+        entry.lastScoreSyncAt = new Date();
+        entry.scoreSyncStatus = 'success';
+        entry.scoreSyncError = '';
+        await entry.save();
+        synced += 1;
+      } catch (error) {
+        entry.lastScoreSyncAt = new Date();
+        entry.scoreSyncStatus = 'failed';
+        entry.scoreSyncError = String(error.message || 'FPL score sync failed.').slice(0, 500);
+        await entry.save();
+        failed += 1;
+        failures.push(`${entry.userId?.fullName || managerId}: ${entry.scoreSyncError}`);
+      }
     }
 
-    try {
-      if (!entry.fantasyManagerId) entry.fantasyManagerId = managerId;
-      const scoreResult = await scoreManagerForLeague(managerId, league, scoreThroughGameweek);
-      entry.currentScore = scoreResult.score;
-      entry.scoreThroughGameweek = scoreThroughGameweek;
-      entry.latestOverallRank = scoreResult.latestOverallRank;
-      entry.scoreDetails = scoreResult.details || {};
-      entry.lastScoreSyncAt = new Date();
-      entry.scoreSyncStatus = 'success';
-      entry.scoreSyncError = '';
-      await entry.save();
-      synced += 1;
-    } catch (error) {
-      entry.lastScoreSyncAt = new Date();
-      entry.scoreSyncStatus = 'failed';
-      entry.scoreSyncError = String(error.message || 'FPL score sync failed.').slice(0, 500);
-      await entry.save();
-      failed += 1;
-      failures.push(`${entry.userId?.fullName || managerId}: ${entry.scoreSyncError}`);
+    const rankedEntries = await LeagueEntry.find({ leagueId: league._id, paymentStatus: 'paid' }).sort({
+      currentScore: -1,
+      latestOverallRank: 1,
+      joinedAt: 1,
+    });
+    for (let index = 0; index < rankedEntries.length; index += 1) {
+      rankedEntries[index].currentRank = index + 1;
+      await rankedEntries[index].save();
     }
-  }
 
-  const rankedEntries = await LeagueEntry.find({ leagueId: league._id, paymentStatus: 'paid' }).sort({
-    currentScore: -1,
-    latestOverallRank: 1,
-    joinedAt: 1,
-  });
-  for (let index = 0; index < rankedEntries.length; index += 1) {
-    rankedEntries[index].currentRank = index + 1;
-    await rankedEntries[index].save();
-  }
+    league.currentGameweek = scoreThroughGameweek;
+    league.scoreThroughGameweek = scoreThroughGameweek;
+    league.lastScoredAt = new Date();
+    league.scoreSyncStatus = failed ? (synced ? 'partial' : 'failed') : 'success';
+    league.scoreSyncMessage = failed
+      ? `${synced} member(s) synced; ${failed} failed. ${failures.slice(0, 3).join(' | ')}`
+      : `${synced} member score(s) synced through Gameweek ${scoreThroughGameweek}.`;
+    if (leagueIsPast(league) && ['open', 'full', 'upcoming', 'live'].includes(league.status)) {
+      league.status = 'awaiting-review';
+      league.completedAt = league.completedAt || new Date();
+    }
+    await league.save();
 
-  league.currentGameweek = scoreThroughGameweek;
-  league.scoreThroughGameweek = scoreThroughGameweek;
-  league.lastScoredAt = new Date();
-  league.scoreSyncStatus = failed ? (synced ? 'partial' : 'failed') : 'success';
-  league.scoreSyncMessage = failed
-    ? `${synced} member(s) synced; ${failed} failed. ${failures.slice(0, 3).join(' | ')}`
-    : `${synced} member score(s) synced through Gameweek ${scoreThroughGameweek}.`;
-  if (leagueIsPast(league) && ['open', 'full', 'upcoming', 'live'].includes(league.status)) {
-    league.status = 'awaiting-review';
-    league.completedAt = league.completedAt || new Date();
+    return { league, synced, failed, cached: false, scoreThroughGameweek, failures };
+  } catch (error) {
+    // Record the failure visibly instead of leaving scoreSyncStatus stuck at
+    // 'syncing'. lastScoredAt is deliberately NOT updated here so the next
+    // call (whether user-triggered or the new admin refresh button) doesn't
+    // get blocked by the freshness cache and will retry immediately.
+    league.scoreSyncStatus = 'failed';
+    league.scoreSyncMessage = `Score sync failed before any members could be scored: ${String(error.message || error).slice(0, 400)}`;
+    await league.save();
+    throw error;
   }
-  await league.save();
-
-  return { league, synced, failed, cached: false, scoreThroughGameweek, failures };
 }
 
 async function syncActiveLeagueScores(limit = FPL_LEAGUE_SYNC_LIMIT) {
@@ -5746,14 +5765,66 @@ app.post('/api/admin/leagues/:id/settlement/manual', requireAdmin, writeLimiter,
   } catch (error) { next(error); }
 });
 
+// Platform-wide "check results status and update it" sweep. This is additive
+// to the existing per-league Refresh diagnostics / Retry settlement controls
+// on the league detail page — it just runs that same kind of check across
+// every league at once, so an admin doesn't have to open each league
+// individually to notice a stalled score sync or a league that's now ready
+// to settle. Supreme leagues go through the existing runMaintenance() (score
+// enrollment + settlement check); standard/custom leagues get a forced score
+// resync so any that were stuck get a fresh, visible status.
+app.post('/api/admin/maintenance/check-results', requireAdmin, writeLimiter, async (req, res, next) => {
+  try {
+    const supreme = await localGrowth.runMaintenance();
+
+    const activeStandardLeagues = await League.find({
+      officialSupremeLeague: false,
+      status: { $in: ['open', 'full', 'upcoming', 'live', 'awaiting-review'] },
+    }).select('_id name').lean();
+
+    let refreshed = 0;
+    const failures = [];
+    for (const league of activeStandardLeagues) {
+      try {
+        await syncLeagueScores(league._id, { force: true });
+        refreshed += 1;
+      } catch (error) {
+        failures.push(`${league.name}: ${String(error.message || error).slice(0, 200)}`);
+      }
+    }
+
+    const summary = {
+      supreme,
+      standard: { checked: activeStandardLeagues.length, refreshed, failures: failures.slice(0, 15) },
+    };
+    await adminAudit(req, 'maintenance.check-results', 'League', null, summary);
+    return success(res, summary);
+  } catch (error) { next(error); }
+});
+
 app.post('/api/admin/leagues/:id/members', requireAdmin, writeLimiter, async (req, res, next) => {
   try {
     const user = await User.findOne(req.body.userId ? { _id: req.body.userId } : { email: normalizeEmail(req.body.email) });
     if (!user) return failure(res, 404, 'User not found.');
     const paymentStatus = ['pending', 'paid', 'failed', 'refunded'].includes(req.body.paymentStatus) ? req.body.paymentStatus : 'paid';
+    // $set (not $setOnInsert) for paymentStatus/eligibilityStatus/fantasyManagerId, so
+    // re-running this against an EXISTING entry actually takes effect. It previously
+    // used $setOnInsert for all three, which Mongo only applies on a brand-new insert —
+    // if a stray entry already existed for this user (e.g. left 'pending' from an
+    // abandoned checkout), calling this endpoint was a silent no-op: the admin's UI
+    // showed the member as added, but paymentStatus never became 'paid', so every
+    // scoring query (which filters on paymentStatus:'paid') skipped them forever even
+    // though they visibly appeared in the league's member list.
     const entry = await LeagueEntry.findOneAndUpdate(
       { leagueId: req.params.id, userId: user._id },
-      { $setOnInsert: { fantasyManagerId: user.fplManagerId, joinedAt: new Date(), paymentStatus } },
+      {
+        $set: {
+          paymentStatus,
+          eligibilityStatus: 'eligible',
+          ...(user.fplManagerId ? { fantasyManagerId: user.fplManagerId } : {}),
+        },
+        $setOnInsert: { joinedAt: new Date() },
+      },
       { new: true, upsert: true, setDefaultsOnInsert: true }
     );
     await adminAudit(req, 'league.member.added', 'League', req.params.id, { userId: user._id });
@@ -5978,6 +6049,61 @@ app.post('/api/admin/users/:id/wallet/credit', requireAdmin, writeLimiter, async
 
     await emailService.notifyAdminWalletAdjustment(transaction);
     await adminAudit(req, 'wallet.credited', 'User', user._id, { amountCents, reason });
+
+    const wallet = await Wallet.findOne({ userId: user._id }).lean();
+    return success(res, { wallet, transaction });
+  } catch (error) { next(error); }
+});
+
+// For charging a member's wallet after an admin manually adds them to a paid
+// league (bypassing the normal checkout flow — see /api/admin/leagues/:id/members).
+// Refuses to take the balance negative unless `force: true` is explicitly
+// passed, since that's the safety net normal checkout would have provided.
+app.post('/api/admin/users/:id/wallet/debit', requireAdmin, writeLimiter, async (req, res, next) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) return failure(res, 404, 'User not found.');
+
+    const reason = String(req.body.reason || '').trim().slice(0, 500);
+    if (!reason) return failure(res, 400, 'Provide a reason for this wallet deduction.');
+
+    const amountCents = Math.round(Number(req.body.amountCents));
+    if (!Number.isFinite(amountCents) || amountCents <= 0) {
+      return failure(res, 400, 'Provide a deduction amount greater than $0.00.');
+    }
+
+    await ensureUserResources(user._id);
+    const currentWallet = await Wallet.findOne({ userId: user._id }).lean();
+    const currentBalance = Number(currentWallet?.availableBalanceCents || 0);
+    if (currentBalance < amountCents && !req.body.force) {
+      return failure(res, 400, `This member's wallet only has $${(currentBalance / 100).toFixed(2)} available — deducting $${(amountCents / 100).toFixed(2)} would take it negative. Pass force to override.`);
+    }
+
+    const reference = createReference('ADMD');
+    const transaction = await Transaction.create({
+      userId: user._id,
+      reference,
+      type: 'adjustment',
+      direction: 'debit',
+      amountCents,
+      currency: 'USD',
+      provider: 'admin',
+      status: 'completed',
+      description: `Wallet debited by admin — ${reason}`,
+      metadata: { reason, adminId: String(req.user._id) },
+    });
+
+    await updateWalletBalances(
+      user._id,
+      { availableBalanceCents: -amountCents },
+      `Admin wallet debit ${reference}`,
+      'adminDebitWallet',
+      {},
+      `${reference}:admin-debit`
+    );
+
+    await emailService.notifyAdminWalletAdjustment(transaction);
+    await adminAudit(req, 'wallet.debited', 'User', user._id, { amountCents, reason, forced: currentBalance < amountCents });
 
     const wallet = await Wallet.findOne({ userId: user._id }).lean();
     return success(res, { wallet, transaction });
@@ -7633,11 +7759,23 @@ const localGrowth = (() => {
       }
 
       async function scoreSupremeEntry(entry, meta) {
-        if (!entry.fantasyManagerId) throw new Error('No FPL manager ID is stored for this Supreme league entry.');
-        if (meta.scoringMode === 'captain-vice') {
-          return captainVicePoints(entry.fantasyManagerId, meta.endGameweek);
+        // Fall back to the member's current User.fplManagerId if the entry's own
+        // fantasyManagerId is blank. This happens for entries an admin added
+        // before the member had linked their FPL team — the League Entry field
+        // only ever gets set at creation/re-add time, so without this fallback a
+        // member who links their team afterward stays permanently unscoreable
+        // for this league, which also blocks settlement for the whole league
+        // ('Settlement paused because N eligible entries could not be scored').
+        let managerId = entry.fantasyManagerId;
+        if (!managerId) {
+          const owner = await User.findById(entry.userId).select('fplManagerId').lean();
+          managerId = owner?.fplManagerId || '';
         }
-        return { score: await managerPoints(entry.fantasyManagerId, meta.startGameweek, meta.endGameweek), details: { scoringMode: 'manager-points' } };
+        if (!managerId) throw new Error('No FPL manager ID is stored for this Supreme league entry.');
+        if (meta.scoringMode === 'captain-vice') {
+          return captainVicePoints(managerId, meta.endGameweek);
+        }
+        return { score: await managerPoints(managerId, meta.startGameweek, meta.endGameweek), details: { scoringMode: 'manager-points' } };
       }
 
       async function settleSupremeLeague(meta, bootstrap, options = {}) {

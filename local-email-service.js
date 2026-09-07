@@ -404,22 +404,38 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
     const user = await User.findById(transaction.userId).lean();
     if (!user) return null;
     const isRefund = transaction.type === 'refund';
+    // Debit is any non-refund adjustment that took money OUT of the wallet
+    // (e.g. an admin charging a member for a manually-added paid league
+    // entry). Without this branch, a debit fell into the credit copy below
+    // and told the member their wallet was credited when it was actually
+    // reduced — the opposite of what happened.
+    const isDebit = !isRefund && transaction.direction === 'debit';
     const reasonNote = String(transaction.metadata?.reason || '').trim() || transaction.description;
+
+    const eventType = isRefund ? 'wallet.admin-refund' : (isDebit ? 'wallet.admin-debit' : 'wallet.admin-credit');
+    const subject = isRefund
+      ? `You've been refunded ${formatUsd(transaction.amountCents)} to your Supreme wallet`
+      : isDebit
+        ? `Your Supreme wallet was debited ${formatUsd(transaction.amountCents)}`
+        : `Your Supreme wallet was credited ${formatUsd(transaction.amountCents)}`;
+    const eyebrow = isRefund ? 'Refund issued' : (isDebit ? 'Wallet debit' : 'Wallet credit');
+    const title = isRefund ? 'Your subscription was cancelled and refunded' : 'Your wallet balance was adjusted';
+    const intro = isRefund
+      ? `An administrator cancelled your subscription and credited ${formatUsd(transaction.amountCents)} back to your Supreme wallet.`
+      : isDebit
+        ? `An administrator deducted ${formatUsd(transaction.amountCents)} from your Supreme wallet.`
+        : `An administrator credited ${formatUsd(transaction.amountCents)} to your Supreme wallet.`;
 
     return sendBrandedEmail({
       user,
-      eventType: isRefund ? 'wallet.admin-refund' : 'wallet.admin-credit',
+      eventType,
       dedupeKey: `wallet-adjustment:${transaction.reference}`,
-      subject: isRefund
-        ? `You've been refunded ${formatUsd(transaction.amountCents)} to your Supreme wallet`
-        : `Your Supreme wallet was credited ${formatUsd(transaction.amountCents)}`,
-      eyebrow: isRefund ? 'Refund issued' : 'Wallet credit',
-      title: isRefund ? 'Your subscription was cancelled and refunded' : 'Your wallet balance was adjusted',
-      intro: isRefund
-        ? `An administrator cancelled your subscription and credited ${formatUsd(transaction.amountCents)} back to your Supreme wallet.`
-        : `An administrator credited ${formatUsd(transaction.amountCents)} to your Supreme wallet.`,
+      subject,
+      eyebrow,
+      title,
+      intro,
       content: detailRows([
-        { label: 'Amount credited', value: formatUsd(transaction.amountCents) },
+        { label: isDebit ? 'Amount deducted' : 'Amount credited', value: formatUsd(transaction.amountCents) },
         { label: 'Reason', value: reasonNote },
         { label: 'Reference', value: transaction.reference },
         { label: 'Date', value: formatDateTime(transaction.updatedAt || transaction.createdAt || new Date()) },
