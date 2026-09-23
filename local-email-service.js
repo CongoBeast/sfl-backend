@@ -294,18 +294,38 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
     });
   }
 
-  async function notifyOwnerPayment(transaction, user) {
-    if (!ADMIN_NOTIFICATION_EMAIL || transaction.status !== 'completed') return { skipped: true };
+  async function notifyOwnerPayment(transaction, user, state = '') {
+    if (!ADMIN_NOTIFICATION_EMAIL) return { skipped: true, reason: 'admin-notification-email-not-configured' };
     if (!['subscription', 'entry-fee', 'deposit'].includes(transaction.type)) return { skipped: true, reason: 'not-customer-payment' };
+    const paymentState = state || (transaction.status === 'completed' ? 'success' : 'failed');
+    if (!['success', 'failed', 'reversed'].includes(paymentState)) return { skipped: true, reason: 'state-not-notifiable' };
+    const successful = paymentState === 'success';
+    const reversed = paymentState === 'reversed';
+    const eventSuffix = successful ? 'completed' : reversed ? 'reversed' : 'failed';
+    const subject = successful
+      ? `Payment received: ${formatUsd(transaction.amountCents)} from ${user.fullName}`
+      : reversed
+        ? `Payment reversed: ${formatUsd(transaction.amountCents)} — ${user.fullName}`
+        : `Payment failed: ${formatUsd(transaction.amountCents)} — ${user.fullName}`;
+    const title = successful
+      ? 'A payment has been confirmed'
+      : reversed
+        ? 'A customer payment was reversed'
+        : 'A customer payment failed';
+    const intro = successful
+      ? `${user.fullName} completed a ${transaction.type === 'entry-fee' ? 'league entry' : transaction.type} payment.`
+      : reversed
+        ? `${user.fullName}'s ${transaction.type === 'entry-fee' ? 'league entry' : transaction.type} payment was reversed or refunded.`
+        : `${user.fullName}'s ${transaction.type === 'entry-fee' ? 'league entry' : transaction.type} payment did not complete successfully.`;
     return sendBrandedEmail({
       recipientEmail: ADMIN_NOTIFICATION_EMAIL,
       bypassPreferences: true,
-      eventType: 'operations.payment-completed',
-      dedupeKey: `operations-payment-completed:${transaction.reference}`,
-      subject: `Payment received: ${formatUsd(transaction.amountCents)} from ${user.fullName}`,
-      eyebrow: 'Completed customer payment',
-      title: 'A payment has been confirmed',
-      intro: `${user.fullName} completed a ${transaction.type === 'entry-fee' ? 'league entry' : transaction.type} payment.`,
+      eventType: `operations.payment-${eventSuffix}`,
+      dedupeKey: `operations-payment-${eventSuffix}:${transaction.reference}`,
+      subject,
+      eyebrow: successful ? 'Completed customer payment' : reversed ? 'Reversed customer payment' : 'Failed customer payment',
+      title,
+      intro,
       content: detailRows([
         { label: 'Customer', value: user.fullName },
         { label: 'Email', value: user.email },
@@ -313,7 +333,8 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
         { label: 'Purpose', value: transaction.description },
         { label: 'Method', value: transaction.metadata?.method || transaction.provider },
         { label: 'Reference', value: transaction.reference },
-        { label: 'Confirmed', value: formatDateTime(transaction.updatedAt || new Date()) },
+        { label: 'Status', value: transaction.metadata?.paynowStatus || transaction.status },
+        { label: 'Updated', value: formatDateTime(transaction.updatedAt || new Date()) },
       ]),
       actionLabel: 'Review finances',
       actionUrl: appLink('/admin/finances'),
@@ -373,7 +394,7 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
       },
     }[state];
 
-    const customerNotification = await sendBrandedEmail({
+    const notifications = [sendBrandedEmail({
       user,
       eventType: `payment.${state}`,
       dedupeKey: `payment:${transaction.reference}:${transaction.status}:${normalizedProviderStatus}`,
@@ -393,10 +414,109 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
       actionUrl: appLink(paymentActionPath(transaction)),
       footerNote: 'Do not approve an unexpected payment prompt. Supreme will never ask by SMS, WhatsApp, email or telephone for an OTP, password, PIN, CVC or a direct transfer of funds. Contact support inside the app if you did not initiate this payment.',
       metadata: { transactionId: transaction._id, reference: transaction.reference, status: transaction.status },
-    });
+    })];
 
-    if (state === 'success') await notifyOwnerPayment(transaction, user);
-    return customerNotification;
+    // Operational alerts must still be attempted even if the customer's
+    // mailbox rejects the transactional email. Keeping these sends independent
+    // prevents a bad customer address from hiding a failed payment/withdrawal
+    // from the admin team.
+    if (['success', 'failed', 'reversed'].includes(state)) {
+      notifications.push(notifyOwnerPayment(transaction, user, state));
+    }
+    if (transaction.type === 'withdrawal' && ['pending', 'processing'].includes(transaction.status)) {
+      notifications.push(notifyOwnerWithdrawalRequest(transaction, user));
+    }
+
+    const results = await Promise.allSettled(notifications);
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        console.error(`[email] ${index === 0 ? 'customer payment' : 'operations'} notification failed`, result.reason);
+      }
+    });
+    return results[0]?.status === 'fulfilled'
+      ? results[0].value
+      : { status: 'failed', error: String(results[0]?.reason?.message || results[0]?.reason || 'Email send failed') };
+  }
+
+  async function notifyOwnerWithdrawalRequest(transaction, user) {
+    if (!ADMIN_NOTIFICATION_EMAIL) return { skipped: true, reason: 'admin-notification-email-not-configured' };
+    if (!transaction || transaction.type !== 'withdrawal') return { skipped: true, reason: 'not-withdrawal' };
+    return sendBrandedEmail({
+      recipientEmail: ADMIN_NOTIFICATION_EMAIL,
+      bypassPreferences: true,
+      eventType: 'operations.withdrawal-requested',
+      dedupeKey: `operations-withdrawal-requested:${transaction.reference}`,
+      subject: `Withdrawal requested: ${formatUsd(transaction.amountCents)} — ${user.fullName}`,
+      eyebrow: 'Withdrawal request',
+      title: 'A member requested a withdrawal',
+      intro: `${user.fullName} submitted a withdrawal request that requires operational review.`,
+      content: detailRows([
+        { label: 'Customer', value: user.fullName },
+        { label: 'Email', value: user.email },
+        { label: 'Amount', value: formatUsd(transaction.amountCents) },
+        { label: 'Method', value: transaction.metadata?.method || transaction.provider },
+        { label: 'Account', value: transaction.metadata?.accountLast4 ? `••••${transaction.metadata.accountLast4}` : 'Review in admin' },
+        { label: 'Reference', value: transaction.reference },
+        { label: 'Requested', value: formatDateTime(transaction.metadata?.requestedAt || transaction.createdAt || new Date()) },
+      ]),
+      actionLabel: 'Review withdrawal',
+      actionUrl: appLink('/admin/finances'),
+      footerNote: 'Verify the payout destination and wallet reservation in the admin console before processing the withdrawal.',
+      metadata: { transactionId: transaction._id, userId: user._id, reference: transaction.reference },
+    });
+  }
+
+  async function notifyOwnerLeagueMembership(user, league, source = 'payment') {
+    if (!ADMIN_NOTIFICATION_EMAIL) return { skipped: true, reason: 'admin-notification-email-not-configured' };
+    return sendBrandedEmail({
+      recipientEmail: ADMIN_NOTIFICATION_EMAIL,
+      bypassPreferences: true,
+      eventType: 'operations.league-joined',
+      dedupeKey: `operations-league-joined:${league._id}:${user._id}`,
+      subject: `${user.fullName} joined ${league.name}`,
+      eyebrow: 'League activity',
+      title: 'A member joined a league',
+      intro: `${user.fullName} has a confirmed place in ${league.name}.`,
+      content: detailRows([
+        { label: 'Member', value: user.fullName },
+        { label: 'Email', value: user.email },
+        { label: 'League', value: league.name },
+        { label: 'Entry fee', value: formatUsd(league.entryFeeCents) },
+        { label: 'Entry source', value: source },
+        { label: 'Joined', value: formatDateTime(new Date()) },
+      ]),
+      actionLabel: 'Open league',
+      actionUrl: appLink(`/admin/leagues/${league._id}`),
+      footerNote: 'This is an internal membership notification for operational tracking.',
+      metadata: { leagueId: league._id, userId: user._id, source },
+    });
+  }
+
+  async function notifyOwnerSupportTicket(ticket, user) {
+    if (!ADMIN_NOTIFICATION_EMAIL) return { skipped: true, reason: 'admin-notification-email-not-configured' };
+    if (!ticket || !user) return { skipped: true, reason: 'missing-ticket-or-user' };
+    return sendBrandedEmail({
+      recipientEmail: ADMIN_NOTIFICATION_EMAIL,
+      bypassPreferences: true,
+      eventType: 'operations.support-ticket',
+      dedupeKey: `operations-support-ticket:${ticket._id}`,
+      subject: `Support ticket ${ticket.ticketNumber}: ${ticket.subject}`,
+      eyebrow: 'Support request',
+      title: 'A new support ticket was submitted',
+      intro: `${user.fullName} sent a support request that is now waiting in the admin queue.`,
+      content: detailRows([
+        { label: 'Member', value: user.fullName },
+        { label: 'Email', value: user.email },
+        { label: 'Ticket', value: ticket.ticketNumber },
+        { label: 'Category', value: ticket.category },
+        { label: 'Subject', value: ticket.subject },
+        { label: 'Submitted', value: formatDateTime(ticket.createdAt || new Date()) },
+      ]),
+      actionLabel: 'Open support ticket',
+      actionUrl: appLink(`/admin/tickets/${ticket._id}`),
+      footerNote: 'Reply to the member from the support ticket in the admin console.',
+      metadata: { ticketId: ticket._id, userId: user._id, ticketNumber: ticket.ticketNumber },
+    });
   }
 
   async function notifyAdminWalletAdjustment(transaction) {
@@ -501,7 +621,7 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
     const [user, league] = await Promise.all([User.findById(userId).lean(), League.findById(leagueId).lean()]);
     if (!user || !league) return null;
 
-    const result = await sendBrandedEmail({
+    const notifications = [sendBrandedEmail({
       user,
       eventType: 'league.joined',
       dedupeKey: `league-joined:${league._id}:${user._id}`,
@@ -520,12 +640,12 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
       footerNote: 'Your linked FPL manager ID is used to calculate your qualifying gameweek points.',
       category: 'league',
       metadata: { leagueId: league._id },
-    });
+    })];
 
     if (league.createdBy && String(league.createdBy) !== String(user._id)) {
       const creator = await User.findById(league.createdBy).lean();
       if (creator) {
-        await sendBrandedEmail({
+        notifications.push(sendBrandedEmail({
           user: creator,
           eventType: 'league.member-joined',
           dedupeKey: `league-member-joined:${league._id}:${user._id}`,
@@ -542,10 +662,20 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
           actionUrl: appLink(`/app/leagues/${league._id}`),
           category: 'league',
           metadata: { leagueId: league._id, joinedUserId: user._id },
-        });
+        }));
       }
     }
-    return result;
+    notifications.push(notifyOwnerLeagueMembership(user, league, source));
+
+    const results = await Promise.allSettled(notifications);
+    results.forEach((notification, index) => {
+      if (notification.status === 'rejected') {
+        console.error(`[email] league membership notification ${index + 1} failed`, notification.reason);
+      }
+    });
+    return results[0]?.status === 'fulfilled'
+      ? results[0].value
+      : { status: 'failed', error: String(results[0]?.reason?.message || results[0]?.reason || 'Email send failed') };
   }
 
   async function notifyLeagueOutcomes(leagueId) {
@@ -686,6 +816,8 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
     notifyOwnerUserSignup: safeNotification('notifyOwnerUserSignup', notifyOwnerUserSignup),
     notifyOwnerAdminSignup: safeNotification('notifyOwnerAdminSignup', notifyOwnerAdminSignup),
     notifyPaymentUpdate: safeNotification('notifyPaymentUpdate', notifyPaymentUpdate),
+    notifyOwnerWithdrawalRequest: safeNotification('notifyOwnerWithdrawalRequest', notifyOwnerWithdrawalRequest),
+    notifyOwnerSupportTicket: safeNotification('notifyOwnerSupportTicket', notifyOwnerSupportTicket),
     notifyAdminWalletAdjustment: safeNotification('notifyAdminWalletAdjustment', notifyAdminWalletAdjustment),
     notifyPerformanceBonus: safeNotification('notifyPerformanceBonus', notifyPerformanceBonus),
     notifyLeagueCreated: safeNotification('notifyLeagueCreated', notifyLeagueCreated),

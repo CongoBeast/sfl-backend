@@ -403,12 +403,19 @@ const userSchema = new Schema({
   status: { type: String, default: 'active', enum: ['active', 'suspended', 'closed'] },
   fplManagerId: { type: String, default: '', trim: true },
   fantasyTeamName: { type: String, default: '' },
+  whatsappOutreach: {
+    contacted: { type: Boolean, default: false },
+    contactedAt: { type: Date, default: null },
+    contactedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+    note: { type: String, default: '', maxlength: 500 },
+  },
 }, { timestamps: true });
 
 userSchema.index(
   { fplManagerId: 1 },
   { unique: true, partialFilterExpression: { fplManagerId: { $type: 'string', $gt: '' } } }
 );
+userSchema.index({ 'whatsappOutreach.contacted': 1, createdAt: -1 });
 
 const userProfileSchema = new Schema({
   userId: { type: Schema.Types.ObjectId, ref: 'User', unique: true, required: true, index: true },
@@ -838,32 +845,25 @@ async function verifiedSubscriptions(subscriptions = [], { markInvalid = false }
     : [];
   const transactionMap = new Map(transactions.map((transaction) => [String(transaction._id), transaction]));
 
-  // Wallet subscriptions must be backed by real ledger credits that existed before the
-  // purchase. This rejects historical/demo wallet seeds that were only numbers on the
-  // Wallet document and never represented by a completed deposit/prize/refund/bonus.
+  // Wallet subscriptions must prove that the atomic wallet debit was actually applied.
+  // Older accounts can legitimately contain wallet funds that pre-date the current
+  // transaction-ledger reconstruction rules. Reconstructing the user's entire historic
+  // balance here therefore caused valid wallet purchases to be rejected even after the
+  // real Wallet document had been debited. The operation-reference check below keeps the
+  // entitlement/payment integrity guarantee without incorrectly rejecting legacy funds.
   const targetWalletTransactions = transactions.filter((transaction) => transaction.provider === 'wallet');
-  const walletFundingMap = new Map();
+  const walletDebitAppliedMap = new Map();
   if (targetWalletTransactions.length) {
-    const walletUserIds = [...new Set(targetWalletTransactions.map((transaction) => String(transaction.userId)))].map((id) => new mongoose.Types.ObjectId(id));
-    const history = await Transaction.find({
-      userId: { $in: walletUserIds },
-      status: 'completed',
-      $or: [
-        { direction: 'credit' },
-        { direction: 'debit', provider: 'wallet' },
-        { direction: 'debit', type: 'withdrawal' },
-      ],
-    }).select('_id userId direction amountCents provider type createdAt').sort({ userId: 1, createdAt: 1, _id: 1 }).lean();
-    const targetIds = new Set(targetWalletTransactions.map((transaction) => String(transaction._id)));
-    const balances = new Map();
-    for (const transaction of history) {
-      const key = String(transaction.userId);
-      const balanceBefore = Number(balances.get(key) || 0);
-      if (targetIds.has(String(transaction._id))) {
-        walletFundingMap.set(String(transaction._id), balanceBefore >= Number(transaction.amountCents || 0));
-      }
-      const delta = transaction.direction === 'credit' ? Number(transaction.amountCents || 0) : -Number(transaction.amountCents || 0);
-      balances.set(key, balanceBefore + delta);
+    const wallets = await Wallet.find({
+      userId: { $in: [...new Set(targetWalletTransactions.map((transaction) => String(transaction.userId)))].map((id) => new mongoose.Types.ObjectId(id)) },
+    }).select('userId appliedTransactionReferences').lean();
+    const walletMap = new Map(wallets.map((wallet) => [String(wallet.userId), new Set(wallet.appliedTransactionReferences || [])]));
+    for (const transaction of targetWalletTransactions) {
+      const references = walletMap.get(String(transaction.userId));
+      walletDebitAppliedMap.set(
+        String(transaction._id),
+        Boolean(references?.has(`${transaction.reference}:wallet-debit`))
+      );
     }
   }
 
@@ -872,8 +872,8 @@ async function verifiedSubscriptions(subscriptions = [], { markInvalid = false }
   for (const subscription of items) {
     const transaction = transactionMap.get(String(subscription.paymentTransactionId || '')) || null;
     const check = subscriptionPaymentVerification(subscription, transaction);
-    if (check.verified && transaction?.provider === 'wallet' && walletFundingMap.get(String(transaction._id)) !== true) {
-      invalid.push({ subscription, reason: 'wallet-purchase-not-backed-by-prior-ledger-credits' });
+    if (check.verified && transaction?.provider === 'wallet' && walletDebitAppliedMap.get(String(transaction._id)) !== true) {
+      invalid.push({ subscription, reason: 'wallet-debit-not-applied' });
     } else if (check.verified) {
       verified.push(subscription);
     } else {
@@ -4078,15 +4078,11 @@ async function debitWalletForPurchase({ userId, transaction, amountCents, lifeti
 
   const requested = Number(amountCents || 0);
   if (!Number.isInteger(requested) || requested <= 0) return { wallet: null, newlyApplied: false, reason: 'invalid-purchase-amount' };
-  const [currentWallet, ledgerBackedCents] = await Promise.all([
-    Wallet.findOne({ userId }).lean(),
-    ledgerBackedWalletBalanceCents(userId),
-  ]);
-  const spendableBackedCents = Math.min(Number(currentWallet?.availableBalanceCents || 0), ledgerBackedCents);
-  if (spendableBackedCents < requested) {
-    return { wallet: null, newlyApplied: false, reason: 'wallet-balance-not-backed-by-completed-ledger-credits' };
-  }
-
+  // The Wallet document is the authoritative spendable balance and is mutated only by
+  // server-side atomic operations. Requiring a full historical ledger reconstruction
+  // here blocked legitimate legacy balances that were created before every balance
+  // change had a Transaction row. The findOneAndUpdate below still prevents overdrafts
+  // and the applied-operation reference keeps the debit idempotent.
   const wallet = await Wallet.findOneAndUpdate(
     {
       userId,
@@ -4223,7 +4219,7 @@ app.post('/api/payments/wallet/subscription', requireAuth, writeLimiter, async (
         $set: { status: 'rejected', 'metadata.failureReason': 'Insufficient wallet balance', 'metadata.finalizedAt': new Date() },
       }, { new: true });
       await emailService.notifyPaymentUpdate(transaction);
-      return failure(res, 400, debit.reason === 'wallet-balance-not-backed-by-completed-ledger-credits' ? 'Your wallet contains an unverified/demo balance that cannot be used for paid subscriptions. Use a balance funded by completed deposits, prizes, bonuses or refunds.' : 'Your wallet balance is not enough for this subscription. Deposit with Paynow or choose Paynow at checkout.');
+      return failure(res, 400, 'Your wallet balance is not enough for this subscription. Deposit with Paynow or choose Paynow at checkout.');
     }
     debited = true;
 
@@ -5046,7 +5042,10 @@ app.get('/api/subscription', requireAuth, async (req, res, next) => {
       subscription: subscriptionPayload,
       wallet: walletClientView(resources.wallet),
       history,
-      plans: Object.values(PLANS),
+      plans: Object.values(PLANS).map((plan) => ({
+        ...plan,
+        amountCents: canonicalPlanAmountCents(plan),
+      })),
       mockCheckout: MOCK_PAYMENTS,
       paymentMode: PAYMENTS_MODE,
       paynowTestMode: PAYNOW_TEST_MODE,
@@ -5283,7 +5282,13 @@ app.post('/api/support/tickets', requireAuth, writeLimiter, async (req, res, nex
       lastActivityAt: new Date(),
     });
 
-    await localGrowth.notifySupportTicketReceived({ ticket, user: req.user });
+    // A support ticket must be saved successfully even if either email provider
+    // call fails. Both the customer acknowledgement and internal admin alert
+    // are attempted independently.
+    await Promise.allSettled([
+      localGrowth.notifySupportTicketReceived({ ticket, user: req.user }),
+      emailService.notifyOwnerSupportTicket(ticket, req.user),
+    ]);
     return success(res, {
       ticket,
       message: 'Your support request has been received and will be attended to shortly.',
@@ -5846,6 +5851,115 @@ app.get('/api/admin/users', requireAdmin, async(req,res,next)=>{try{
   const [subs,entries,wallets]=await Promise.all([Subscription.find({userId:{$in:ids},status:'active'}).lean(),LeagueEntry.aggregate([{ $match:{userId:{$in:ids}}},{ $group:{_id:'$userId',count:{$sum:1}}}]),Wallet.find({userId:{$in:ids}}).lean()]);
   const sm=new Map(subs.map(x=>[String(x.userId),x])); const em=new Map(entries.map(x=>[String(x._id),x.count])); const wm=new Map(wallets.map(x=>[String(x.userId),x])); return success(res,{rows:rows.map(u=>({...adminPublicUser(u),subscription:sm.get(String(u._id))||null,leagueCount:em.get(String(u._id))||0,wallet:wm.get(String(u._id))||null})),pagination:{page,limit,total,pages:Math.ceil(total/limit)}});
 }catch(error){next(error);}});
+
+async function paidLeagueParticipantIds() {
+  // A paid league is any confirmed entry that was not the explicit free-entry
+  // path (currently Clash of the Captains). Older records can have a blank
+  // entrySource, so $ne:'free' intentionally includes those paid records.
+  return LeagueEntry.distinct('userId', {
+    paymentStatus: 'paid',
+    entrySource: { $ne: 'free' },
+  });
+}
+
+app.get('/api/admin/outreach', requireAdmin, async (req, res, next) => {
+  try {
+    const { page, limit } = pageOptions(req);
+    const search = String(req.query.search || '').trim();
+    const contactedFilter = String(req.query.contacted || 'all').toLowerCase();
+    const teamFilter = String(req.query.team || 'all').toLowerCase();
+    const paidLeagueFilter = String(req.query.paidLeague || 'all').toLowerCase();
+
+    const paidIds = await paidLeagueParticipantIds();
+    const paidIdSet = new Set(paidIds.map(String));
+    const filter = { role: 'user' };
+
+    if (search) {
+      const expression = new RegExp(escapeRegex(search), 'i');
+      filter.$or = [{ fullName: expression }, { email: expression }, { phone: expression }];
+    }
+    if (contactedFilter === 'contacted') filter['whatsappOutreach.contacted'] = true;
+    if (contactedFilter === 'uncontacted') filter['whatsappOutreach.contacted'] = { $ne: true };
+    if (teamFilter === 'linked') filter.fplManagerId = { $type: 'string', $ne: '' };
+    if (teamFilter === 'unlinked') filter.$and = [...(filter.$and || []), { $or: [{ fplManagerId: '' }, { fplManagerId: { $exists: false } }] }];
+    if (paidLeagueFilter === 'played') filter._id = { $in: paidIds };
+    if (paidLeagueFilter === 'never') filter._id = { $nin: paidIds };
+
+    const [rows, total, totalUsers, contactedCount, notLinkedCount, paidLeagueUserCount] = await Promise.all([
+      User.find(filter).sort({ 'whatsappOutreach.contacted': 1, createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+      User.countDocuments(filter),
+      User.countDocuments({ role: 'user' }),
+      User.countDocuments({ role: 'user', 'whatsappOutreach.contacted': true }),
+      User.countDocuments({ role: 'user', $or: [{ fplManagerId: '' }, { fplManagerId: { $exists: false } }] }),
+      User.countDocuments({ role: 'user', _id: { $in: paidIds } }),
+    ]);
+
+    const uncontactedCount = Math.max(0, totalUsers - contactedCount);
+    const neverPaidLeagueCount = Math.max(0, totalUsers - paidLeagueUserCount);
+    const percentage = (count) => totalUsers ? Math.round((Number(count || 0) / totalUsers) * 1000) / 10 : 0;
+
+    return success(res, {
+      rows: rows.map((user) => ({
+        ...adminPublicUser(user),
+        fplManagerId: user.fplManagerId || '',
+        fantasyTeamName: user.fantasyTeamName || '',
+        teamLinked: Boolean(user.fplManagerId),
+        hasPlayedPaidLeague: paidIdSet.has(String(user._id)),
+        whatsappOutreach: {
+          contacted: Boolean(user.whatsappOutreach?.contacted),
+          contactedAt: user.whatsappOutreach?.contactedAt || null,
+          contactedBy: user.whatsappOutreach?.contactedBy || null,
+          note: user.whatsappOutreach?.note || '',
+        },
+      })),
+      stats: {
+        totalUsers,
+        contacted: { count: contactedCount, percentage: percentage(contactedCount) },
+        uncontacted: { count: uncontactedCount, percentage: percentage(uncontactedCount) },
+        notLinked: { count: notLinkedCount, percentage: percentage(notLinkedCount) },
+        neverPaidLeague: { count: neverPaidLeagueCount, percentage: percentage(neverPaidLeagueCount) },
+      },
+      pagination: { page, limit, total, pages: Math.max(1, Math.ceil(total / limit)) },
+    });
+  } catch (error) { next(error); }
+});
+
+app.patch('/api/admin/outreach/:id', requireAdmin, writeLimiter, async (req, res, next) => {
+  try {
+    if (typeof req.body.contacted !== 'boolean') return failure(res, 400, 'Provide contacted as true or false.');
+    const note = req.body.note === undefined ? undefined : String(req.body.note || '').trim().slice(0, 500);
+    const now = new Date();
+    const update = req.body.contacted
+      ? {
+          'whatsappOutreach.contacted': true,
+          'whatsappOutreach.contactedAt': now,
+          'whatsappOutreach.contactedBy': req.user._id,
+          ...(note !== undefined ? { 'whatsappOutreach.note': note } : {}),
+        }
+      : {
+          'whatsappOutreach.contacted': false,
+          'whatsappOutreach.contactedAt': null,
+          'whatsappOutreach.contactedBy': null,
+          ...(note !== undefined ? { 'whatsappOutreach.note': note } : {}),
+        };
+    const user = await User.findOneAndUpdate(
+      { _id: req.params.id, role: 'user' },
+      { $set: update },
+      { new: true }
+    ).lean();
+    if (!user) return failure(res, 404, 'User not found.');
+    await adminAudit(req, 'user.whatsapp-outreach.updated', 'User', user._id, {
+      contacted: req.body.contacted,
+      contactedAt: req.body.contacted ? now : null,
+    });
+    return success(res, {
+      user: {
+        ...adminPublicUser(user),
+        whatsappOutreach: user.whatsappOutreach || { contacted: false, contactedAt: null, contactedBy: null, note: '' },
+      },
+    });
+  } catch (error) { next(error); }
+});
 
 app.get('/api/admin/users/:id', requireAdmin, async (req, res, next) => {
   try {
@@ -7433,7 +7547,7 @@ const localGrowth = (() => {
               'Entry closes at the official FPL gameweek deadline.',
               'The competition closes only when FPL marks the gameweek finished and every fixture is finished.',
               'Prizes are paid after FPL marks the gameweek data_checked.',
-              'If first place is tied, the published prize is split fairly among all tied winners.',
+              'If the highest Clash score is tied, the tied player with the best FPL overall rank for that gameweek wins the full published prize.',
             ],
           };
         }
@@ -7708,6 +7822,14 @@ const localGrowth = (() => {
               prizeCents: 0,
               payoutStatus: 'not-applicable',
             });
+            // Auto-enrolments are real league joins too. Route them through the
+            // same transactional workflow so the member and operations inbox
+            // receive the same confirmation as manual/wallet/Paynow joins.
+            await emailService.notifyLeagueMembership(
+              user._id,
+              meta.leagueId,
+              isFreeForAll ? 'Clash free entry' : 'Supreme subscription enrollment'
+            );
             enrolled += 1;
             if (isFreeForAll) freeEntries += 1; else subscriptionEntries += 1;
           }
@@ -7738,9 +7860,13 @@ const localGrowth = (() => {
         if (!captain || !viceCaptain) throw new Error(`FPL picks for manager ${managerId} do not expose both captain and vice-captain for Gameweek ${gameweek}.`);
         return {
           score: Number(captain.points || 0) + Number(viceCaptain.points || 0),
+          latestOverallRank: Number(picks.entryHistory?.overall_rank || Number.MAX_SAFE_INTEGER),
+          gameweekRank: Number(picks.entryHistory?.rank || Number.MAX_SAFE_INTEGER),
           details: {
             scoringMode: 'captain-vice',
             gameweek: Number(gameweek),
+            overallRank: Number(picks.entryHistory?.overall_rank || 0),
+            gameweekRank: Number(picks.entryHistory?.rank || 0),
             captain: { elementId: captain.elementId, name: captain.name, club: captain.club, points: Number(captain.points || 0) },
             viceCaptain: { elementId: viceCaptain.elementId, name: viceCaptain.name, club: viceCaptain.club, points: Number(viceCaptain.points || 0) },
           },
@@ -7835,6 +7961,7 @@ const localGrowth = (() => {
             const scoredEntry = await scoreSupremeEntry(entry, meta);
             entry.previousRank = entry.currentRank || null;
             entry.currentScore = Number(scoredEntry.score || 0);
+            entry.latestOverallRank = Number(scoredEntry.latestOverallRank || Number.MAX_SAFE_INTEGER);
             entry.scoreDetails = scoredEntry.details || {};
             entry.scoreThroughGameweek = meta.endGameweek;
             entry.lastScoreSyncAt = new Date();
@@ -7854,18 +7981,40 @@ const localGrowth = (() => {
           throw new Error(`Settlement paused because ${scoreFailures.length} eligible entr${scoreFailures.length === 1 ? 'y' : 'ies'} could not be scored from FPL. ${scoreFailures.slice(0, 3).join(' | ')}`);
         }
 
-        scored.sort((a, b) => Number(b.currentScore || 0) - Number(a.currentScore || 0) || new Date(a.joinedAt || 0) - new Date(b.joinedAt || 0));
+        const isClash = meta.scoringMode === 'captain-vice';
+        scored.sort((a, b) => {
+          const scoreDifference = Number(b.currentScore || 0) - Number(a.currentScore || 0);
+          if (scoreDifference) return scoreDifference;
+          if (isClash) {
+            const overallRankDifference = Number(a.latestOverallRank || Number.MAX_SAFE_INTEGER) - Number(b.latestOverallRank || Number.MAX_SAFE_INTEGER);
+            if (overallRankDifference) return overallRankDifference;
+            const gameweekRankDifference = Number(a.scoreDetails?.gameweekRank || Number.MAX_SAFE_INTEGER) - Number(b.scoreDetails?.gameweekRank || Number.MAX_SAFE_INTEGER);
+            if (gameweekRankDifference) return gameweekRankDifference;
+          }
+          return new Date(a.joinedAt || 0) - new Date(b.joinedAt || 0);
+        });
         let lastScore = null;
         let rank = 0;
         scored.forEach((entry, index) => {
-          if (lastScore === null || Number(entry.currentScore) !== Number(lastScore)) rank = index + 1;
-          entry.currentRank = rank;
-          lastScore = entry.currentScore;
+          if (isClash) {
+            // Clash ties are explicitly broken by FPL overall rank for this
+            // gameweek, so the ordered leaderboard has a single #1.
+            entry.currentRank = index + 1;
+          } else {
+            if (lastScore === null || Number(entry.currentScore) !== Number(lastScore)) rank = index + 1;
+            entry.currentRank = rank;
+            lastScore = entry.currentScore;
+          }
         });
         await Promise.all(scored.map((entry) => entry.save()));
 
         const topScore = Number(scored[0].currentScore || 0);
-        const winners = scored.filter((entry) => Number(entry.currentScore || 0) === topScore);
+        const tiedTopScorers = scored.filter((entry) => Number(entry.currentScore || 0) === topScore);
+        // Clash of the Captains has one winner. When captain+vice scores tie,
+        // choose the tied user with the best (lowest) FPL overall rank recorded
+        // for that gameweek. Standard Supreme leagues keep their existing split.
+        const winners = isClash ? [tiedTopScorers[0]] : tiedTopScorers;
+        const clashTieBreakApplied = isClash && tiedTopScorers.length > 1;
         const baseSplit = Math.floor(Number(meta.prizeCents || 0) / winners.length);
         let remainder = Number(meta.prizeCents || 0) - baseSplit * winners.length;
         for (let index = 0; index < winners.length; index += 1) {
@@ -7894,7 +8043,7 @@ const localGrowth = (() => {
             title: won ? 'Congratulations — you finished on top' : 'The competition has been settled',
             tone: won ? 'success' : 'brand',
             message: won
-              ? `<p style="margin:0;">You finished with the highest qualifying score${winners.length > 1 ? ' (tied for first)' : ''}. Your ${money(entry.prizeCents)} prize share has been credited to your Supreme wallet and is available for withdrawal.</p>`
+              ? `<p style="margin:0;">${clashTieBreakApplied ? 'You were tied on Clash score and won the tie-break with the best FPL overall rank for the gameweek.' : `You finished with the highest qualifying score${winners.length > 1 ? ' (tied for first)' : ''}.`} Your ${money(entry.prizeCents)} prize${winners.length > 1 ? ' share' : ''} has been credited to your Supreme wallet and is available for withdrawal.</p>`
               : `<p style="margin:0;">The final result is now available. Your score and rank remain available in your league history.</p>`,
             buttonLabel: 'View final standings',
             buttonUrl: `${appUrl}/app/leagues/${meta.leagueId}`,
@@ -7902,6 +8051,7 @@ const localGrowth = (() => {
               { label: 'Competition', value: league?.name || meta.periodLabel },
               { label: 'Final rank', value: entry.currentRank || '—' },
               { label: 'Score', value: entry.currentScore || 0 },
+              ...(isClash ? [{ label: 'FPL overall rank', value: Number.isFinite(Number(entry.latestOverallRank)) && Number(entry.latestOverallRank) < Number.MAX_SAFE_INTEGER ? Number(entry.latestOverallRank).toLocaleString('en-GB') : '—' }] : []),
               { label: 'Prize share', value: won ? money(entry.prizeCents) : money(0) },
             ],
           });
@@ -8175,7 +8325,9 @@ const localGrowth = (() => {
                 paymentOptions: weeklyPaidEntry ? ['subscription', 'one-off'] : (meta.entryMode === 'free-all' ? ['free'] : ['subscription']),
                 scoringMode: meta.scoringMode || 'manager-points',
                 teamLinked: Boolean(req.user.fplManagerId),
-                tieRule: 'If two or more users finish with the same highest score, the prize is split fairly among all tied winners.',
+                tieRule: meta.scoringMode === 'captain-vice'
+                  ? 'If the highest Clash score is tied, the tied player with the best FPL overall rank for that gameweek wins the full prize.'
+                  : 'If two or more users finish with the same highest score, the prize is split fairly among all tied winners.',
               };
             }));
           } catch (error) { next(error); }
