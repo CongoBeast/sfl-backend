@@ -65,6 +65,12 @@ const LEGAL_PRIVACY_VERSION = String(process.env.LEGAL_PRIVACY_VERSION || '1.0')
 const LEGAL_RULES_VERSION = String(process.env.LEGAL_RULES_VERSION || '1.0').trim();
 const LEGAL_EFFECTIVE_DATE = String(process.env.LEGAL_EFFECTIVE_DATE || '2026-08-03').trim();
 const ADMIN_NOTIFICATION_EMAIL = String(process.env.ADMIN_NOTIFICATION_EMAIL || '').trim().toLowerCase();
+const META_GRAPH_API_VERSION = String(process.env.META_GRAPH_API_VERSION || 'v26.0').trim();
+const META_APP_ID = String(process.env.META_APP_ID || '').trim();
+const META_APP_SECRET = String(process.env.META_APP_SECRET || '').trim();
+const META_ACCESS_TOKEN = String(process.env.META_ACCESS_TOKEN || '').trim();
+const META_AD_ACCOUNT_ID = String(process.env.META_AD_ACCOUNT_ID || '').trim().replace(/^act_/, '');
+const META_REQUEST_TIMEOUT_MS = Math.max(5000, Math.min(30000, Number(process.env.META_REQUEST_TIMEOUT_MS || 15000)));
 mongoose.set('autoIndex', String(process.env.MONGOOSE_AUTO_INDEX || (IS_PRODUCTION ? 'false' : 'true')).trim().toLowerCase() === 'true');
 
 // -----------------------------------------------------------------------------
@@ -408,6 +414,19 @@ const userSchema = new Schema({
     contactedAt: { type: Date, default: null },
     contactedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
     note: { type: String, default: '', maxlength: 500 },
+  },
+  marketingAttribution: {
+    source: { type: String, default: '', trim: true, maxlength: 80 },
+    medium: { type: String, default: '', trim: true, maxlength: 80 },
+    campaignId: { type: String, default: '', trim: true, maxlength: 120, index: true },
+    campaignName: { type: String, default: '', trim: true, maxlength: 180 },
+    adsetId: { type: String, default: '', trim: true, maxlength: 120 },
+    adsetName: { type: String, default: '', trim: true, maxlength: 180 },
+    adId: { type: String, default: '', trim: true, maxlength: 120, index: true },
+    adName: { type: String, default: '', trim: true, maxlength: 180 },
+    fbclid: { type: String, default: '', trim: true, maxlength: 500 },
+    landingPath: { type: String, default: '', trim: true, maxlength: 500 },
+    firstTouchAt: { type: Date, default: null },
   },
 }, { timestamps: true });
 
@@ -2552,6 +2571,34 @@ app.post('/api/waitlist', writeLimiter, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+function cleanAttributionValue(value, maxLength = 180) {
+  return String(value || '').trim().slice(0, maxLength);
+}
+
+function normalizedMarketingAttribution(raw = {}) {
+  const campaignId = cleanAttributionValue(raw.campaignId || raw.metaCampaignId, 120);
+  const adsetId = cleanAttributionValue(raw.adsetId || raw.metaAdsetId, 120);
+  const adId = cleanAttributionValue(raw.adId || raw.metaAdId, 120);
+  const source = cleanAttributionValue(raw.source || raw.utmSource, 80).toLowerCase();
+  const medium = cleanAttributionValue(raw.medium || raw.utmMedium, 80).toLowerCase();
+  const fbclid = cleanAttributionValue(raw.fbclid, 500);
+  const hasMarketingTouch = Boolean(campaignId || adsetId || adId || fbclid || source || medium);
+  if (!hasMarketingTouch) return undefined;
+  return {
+    source,
+    medium,
+    campaignId,
+    campaignName: cleanAttributionValue(raw.campaignName || raw.utmCampaign, 180),
+    adsetId,
+    adsetName: cleanAttributionValue(raw.adsetName, 180),
+    adId,
+    adName: cleanAttributionValue(raw.adName || raw.utmContent, 180),
+    fbclid,
+    landingPath: cleanAttributionValue(raw.landingPath, 500),
+    firstTouchAt: raw.firstTouchAt && !Number.isNaN(new Date(raw.firstTouchAt).getTime()) ? new Date(raw.firstTouchAt) : new Date(),
+  };
+}
+
 app.post('/api/auth/register', authLimiter, async (req, res, next) => {
   try {
     const { fullName, email, phone, dateOfBirth, password, confirmPassword, ageConfirmed, termsAccepted, privacyAccepted, rulesAccepted, securityAcknowledged } = req.body;
@@ -2586,6 +2633,7 @@ app.post('/api/auth/register', authLimiter, async (req, res, next) => {
       dateOfBirth,
       passwordHash,
       ageConfirmed: true,
+      marketingAttribution: normalizedMarketingAttribution(req.body.marketingAttribution),
       legalAcceptance: {
         termsVersion: LEGAL_TERMS_VERSION,
         privacyVersion: LEGAL_PRIVACY_VERSION,
@@ -4351,6 +4399,9 @@ app.post('/api/payments/wallet/league-entry', requireAuth, writeLimiter, async (
       await joinFreeLeagueEntry({ league, userId: req.user._id, fplManagerId: req.user.fplManagerId, existingEntry: existingFreeEntry });
       return success(res, { wallet: walletClientView(await Wallet.findOne({ userId: req.user._id })), league: await leagueView(league, req.user._id), message: 'You have joined this free league. No payment was required.' }, 201);
     }
+    if (!Number.isInteger(Number(league.entryFeeCents)) || Number(league.entryFeeCents) <= 0) {
+      return failure(res, 409, 'This competition is not a free league. Use an eligible subscription or wait for a paid entry option to be published.');
+    }
 
     const existing = await Transaction.findOne({ userId: req.user._id, type: 'entry-fee', 'metadata.idempotencyKey': idempotencyKey });
     if (existing) {
@@ -5509,6 +5560,128 @@ async function getAdminDashboardAnalytics(req) {
   };
 }
 
+function metaAppSecretProof() {
+  if (!META_APP_SECRET || !META_ACCESS_TOKEN) return '';
+  return crypto.createHmac('sha256', META_APP_SECRET).update(META_ACCESS_TOKEN).digest('hex');
+}
+
+function metaConfigured() {
+  return Boolean(META_APP_ID && META_APP_SECRET && META_ACCESS_TOKEN && META_AD_ACCOUNT_ID);
+}
+
+async function fetchMetaCampaignInsights({ since, until }) {
+  if (!metaConfigured()) {
+    const error = new Error('Meta Ads is not configured. Set META_APP_ID, META_APP_SECRET, META_ACCESS_TOKEN and META_AD_ACCOUNT_ID.');
+    error.status = 503;
+    throw error;
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), META_REQUEST_TIMEOUT_MS);
+  try {
+    const params = new URLSearchParams({
+      level: 'campaign',
+      fields: 'campaign_id,campaign_name,impressions,reach,clicks,inline_link_clicks,ctr,cpc,cpm,spend,actions,account_currency',
+      time_range: JSON.stringify({ since, until }),
+      time_increment: 'all_days',
+      limit: '200',
+      access_token: META_ACCESS_TOKEN,
+      use_unified_attribution_setting: 'true',
+    });
+    const proof = metaAppSecretProof();
+    if (proof) params.set('appsecret_proof', proof);
+    const url = `https://graph.facebook.com/${encodeURIComponent(META_GRAPH_API_VERSION)}/act_${encodeURIComponent(META_AD_ACCOUNT_ID)}/insights?${params}`;
+    const response = await fetch(url, { headers: { Accept: 'application/json' }, signal: controller.signal });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload?.error) {
+      const message = payload?.error?.message || `Meta Marketing API returned HTTP ${response.status}.`;
+      const error = new Error(message);
+      error.status = 502;
+      throw error;
+    }
+    return Array.isArray(payload.data) ? payload.data : [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function metaActionCount(actions, names = []) {
+  const wanted = new Set(names);
+  return (Array.isArray(actions) ? actions : []).reduce((sum, action) => wanted.has(action.action_type) ? sum + Number(action.value || 0) : sum, 0);
+}
+
+async function getMetaMarketingDashboard({ days = 30 } = {}) {
+  const boundedDays = Math.max(1, Math.min(365, Number(days) || 30));
+  const untilDate = new Date();
+  const sinceDate = new Date(untilDate.getTime() - (boundedDays - 1) * 86400000);
+  const since = sinceDate.toISOString().slice(0, 10);
+  const until = untilDate.toISOString().slice(0, 10);
+  const insights = await fetchMetaCampaignInsights({ since, until });
+  const campaignIds = insights.map((row) => String(row.campaign_id || '')).filter(Boolean);
+  const attributed = campaignIds.length ? await User.aggregate([
+    { $match: { role: 'user', createdAt: { $gte: sinceDate, $lte: new Date(`${until}T23:59:59.999Z`) }, 'marketingAttribution.campaignId': { $in: campaignIds } } },
+    { $group: { _id: '$marketingAttribution.campaignId', signups: { $sum: 1 }, userIds: { $push: '$_id' } } },
+  ]) : [];
+  const signupByCampaign = new Map(attributed.map((row) => [String(row._id), { signups: Number(row.signups || 0), userIds: row.userIds || [] }]));
+  const allAttributedUserIds = attributed.flatMap((row) => row.userIds || []);
+  const paidUsers = allAttributedUserIds.length ? await Transaction.aggregate([
+    { $match: { userId: { $in: allAttributedUserIds }, status: 'completed', type: { $in: ['subscription', 'entry-fee'] } } },
+    { $group: { _id: '$userId', revenueCents: { $sum: '$amountCents' } } },
+  ]) : [];
+  const paidByUser = new Map(paidUsers.map((row) => [String(row._id), Number(row.revenueCents || 0)]));
+  const campaigns = insights.map((row) => {
+    const campaignId = String(row.campaign_id || '');
+    const local = signupByCampaign.get(campaignId) || { signups: 0, userIds: [] };
+    const spendCents = Math.round(Number(row.spend || 0) * 100);
+    const paidCustomerIds = local.userIds.filter((id) => paidByUser.has(String(id)));
+    const attributedRevenueCents = paidCustomerIds.reduce((sum, id) => sum + Number(paidByUser.get(String(id)) || 0), 0);
+    const signups = Number(local.signups || 0);
+    const paidCustomers = paidCustomerIds.length;
+    return {
+      campaignId,
+      campaignName: row.campaign_name || campaignId || 'Unnamed campaign',
+      impressions: Number(row.impressions || 0),
+      reach: Number(row.reach || 0),
+      clicks: Number(row.inline_link_clicks || row.clicks || 0),
+      ctr: Number(row.ctr || 0),
+      cpcCents: Math.round(Number(row.cpc || 0) * 100),
+      cpmCents: Math.round(Number(row.cpm || 0) * 100),
+      spendCents,
+      metaRegistrations: metaActionCount(row.actions, ['complete_registration', 'offsite_conversion.fb_pixel_complete_registration']),
+      signups,
+      paidCustomers,
+      attributedRevenueCents,
+      costPerSignupCents: signups ? Math.round(spendCents / signups) : 0,
+      signupRateFromClicksPct: Number(row.inline_link_clicks || row.clicks || 0) ? Number(((signups / Number(row.inline_link_clicks || row.clicks || 1)) * 100).toFixed(2)) : 0,
+      costPerPaidCustomerCents: paidCustomers ? Math.round(spendCents / paidCustomers) : 0,
+      roas: spendCents ? Number((attributedRevenueCents / spendCents).toFixed(2)) : 0,
+    };
+  }).sort((a, b) => b.spendCents - a.spendCents);
+  const totals = campaigns.reduce((acc, row) => {
+    acc.spendCents += row.spendCents;
+    acc.impressions += row.impressions;
+    acc.reach += row.reach;
+    acc.clicks += row.clicks;
+    acc.signups += row.signups;
+    acc.paidCustomers += row.paidCustomers;
+    acc.attributedRevenueCents += row.attributedRevenueCents;
+    acc.metaRegistrations += row.metaRegistrations;
+    return acc;
+  }, { spendCents: 0, impressions: 0, reach: 0, clicks: 0, signups: 0, paidCustomers: 0, attributedRevenueCents: 0, metaRegistrations: 0 });
+  totals.ctr = totals.impressions ? Number(((totals.clicks / totals.impressions) * 100).toFixed(2)) : 0;
+  totals.costPerSignupCents = totals.signups ? Math.round(totals.spendCents / totals.signups) : 0;
+  totals.signupRateFromClicksPct = totals.clicks ? Number(((totals.signups / totals.clicks) * 100).toFixed(2)) : 0;
+  totals.costPerPaidCustomerCents = totals.paidCustomers ? Math.round(totals.spendCents / totals.paidCustomers) : 0;
+  totals.roas = totals.spendCents ? Number((totals.attributedRevenueCents / totals.spendCents).toFixed(2)) : 0;
+  return {
+    configured: true,
+    currency: insights.find((row) => row.account_currency)?.account_currency || 'USD',
+    range: { days: boundedDays, since, until },
+    totals,
+    campaigns,
+    attributionNote: 'Platform signups are first-touch matches captured from Meta campaign/ad URL parameters. Keep Meta dynamic URL parameters enabled on every ad for complete campaign-level attribution.',
+  };
+}
+
 function requireAdmin(req, res, next) {
   return requireAuth(req, res, () => {
     if (req.user.role !== 'admin') return failure(res, 403, 'Administrator access is required.');
@@ -5599,6 +5772,12 @@ app.get('/api/admin/dashboard', requireAdmin, async (req, res, next) => {
 app.get('/api/admin/dashboard/analytics', requireAdmin, async (req, res, next) => {
   try {
     return success(res, await getAdminDashboardAnalytics(req));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/admin/marketing/meta', requireAdmin, async (req, res, next) => {
+  try {
+    return success(res, await getMetaMarketingDashboard({ days: req.query.days }));
   } catch (error) { next(error); }
 });
 
@@ -6656,7 +6835,7 @@ const localGrowth = (() => {
         cycleKey: { type: String, required: true, unique: true, index: true },
         cadence: { type: String, enum: ['weekly', 'bi-weekly', 'monthly', 'half-season', 'season', 'clash-captains'], required: true, index: true },
         scoringMode: { type: String, enum: ['manager-points', 'captain-vice'], default: 'manager-points', index: true },
-        entryMode: { type: String, enum: ['subscription', 'weekly-flex', 'free-all'], default: 'subscription', index: true },
+        entryMode: { type: String, enum: ['subscription', 'weekly-flex', 'one-off-flex', 'free-all'], default: 'subscription', index: true },
         periodLabel: { type: String, required: true },
         startGameweek: { type: Number, required: true },
         endGameweek: { type: Number, required: true },
@@ -6704,6 +6883,8 @@ const localGrowth = (() => {
       const appUrl = String(process.env.CLIENT_APP_URL || process.env.CLIENT_ORIGIN || 'http://localhost:3000').replace(/\/$/, '');
       const fplBaseUrl = String(process.env.FPL_BASE_URL || 'https://fantasy.premierleague.com/api').replace(/\/$/, '');
       const maintenanceIntervalMs = cents(process.env.LOCAL_GROWTH_MAINTENANCE_INTERVAL_MS, 300000);
+      const missedWinCompetitionLimit = Math.max(1, Math.min(10, cents(process.env.MISSED_WIN_COMPETITION_LIMIT, 2)));
+      const missedWinUserLimit = Math.max(1, Math.min(250, cents(process.env.MISSED_WIN_USER_LIMIT, 75)));
       const emailsEnabled = bool(process.env.EMAILS_ENABLED, true);
     
       async function sendEmail({ eventKey, userId, to, category, subject, preheader, title, message, buttonLabel, buttonUrl, details, tone, metadata = {} }) {
@@ -7051,14 +7232,14 @@ const localGrowth = (() => {
             const eligible = group.filter((meta) => {
               if (joined.has(`${user._id}:${meta.leagueId}`)) return false;
               if (meta.entryMode === 'free-all') return Boolean(String(user.fplManagerId || '').trim());
-              if (meta.entryMode === 'weekly-flex') return true;
+              if (['weekly-flex', 'one-off-flex'].includes(meta.entryMode)) return true;
               return subs.some((sub) => subscriptionEntitles(sub, meta.cadence, meta));
             });
             if (!eligible.length) continue;
 
             const rows = eligible.map((meta) => {
               const league = leagueMap.get(String(meta.leagueId));
-              const access = meta.entryMode === 'weekly-flex'
+              const access = ['weekly-flex', 'one-off-flex'].includes(meta.entryMode)
                 ? `${money(Number(league?.entryFeeCents ?? meta.entryFeeCents ?? 100))} one-off or eligible subscription`
                 : meta.entryMode === 'free-all' ? 'Free entry' : 'Included with eligible subscription';
               return { label: league?.name || meta.periodLabel, value: access };
@@ -7075,7 +7256,7 @@ const localGrowth = (() => {
               preheader: `Entries close at the official FPL deadline. Your eligible competitions are ready now.`,
               title: `${reminderBucket} hours or less before entries close`,
               tone: reminderBucket === 24 ? 'danger' : 'brand',
-              message: `<p style="margin:0 0 14px;">Hi ${htmlEscape(user.fullName || 'there')}, your eligible Supreme competitions are already open. Join before the official FPL deadline below.</p><p style="margin:0 0 14px;">The weekly league can be entered with an eligible subscription or as a ${money(cents(process.env.SUPREME_WEEKLY_ENTRY_FEE_CENTS, 100))} one-off entry for a ${money(cents(process.env.SUPREME_WEEKLY_PRIZE_CENTS, 1000))} guaranteed prize.</p>${upcomingClash ? `<p style="margin:0;"><strong>September special:</strong> Clash of the Captains is free for linked users. Your captain's raw FPL points plus your vice-captain's raw FPL points determine the leaderboard, with ${money(cents(process.env.SUPREME_CLASH_CAPTAINS_PRIZE_CENTS, 300))} for first place.</p>` : ''}`,
+              message: `<p style="margin:0 0 14px;">Hi ${htmlEscape(user.fullName || 'there')}, your eligible Supreme competitions are already open. Join before the official FPL deadline below.</p><p style="margin:0 0 14px;">Weekly entry is ${money(cents(process.env.SUPREME_WEEKLY_ENTRY_FEE_CENTS, 100))} one-off or included with an eligible subscription. Bi-weekly entry is ${money(cents(process.env.SUPREME_BIWEEKLY_ENTRY_FEE_CENTS, 300))} one-off or included with an eligible subscription.</p>${upcomingClash ? `<p style="margin:0;"><strong>September special:</strong> Clash of the Captains is free for linked users. Your captain's raw FPL points plus your vice-captain's raw FPL points determine the leaderboard, with ${money(cents(process.env.SUPREME_CLASH_CAPTAINS_PRIZE_CENTS, 300))} for first place.</p>` : ''}`,
               buttonLabel: 'View open competitions',
               buttonUrl: `${appUrl}/app/leagues/supreme`,
               details: rows.slice(0, 8),
@@ -7087,17 +7268,97 @@ const localGrowth = (() => {
         return { checked, sent, skipped, deadlines: deadlineGroups.size };
       }
 
+      async function sendMissedWinnerEmails(now = new Date()) {
+        if (FPL_DATA_MODE !== 'public') return { skipped: true, reason: 'fpl-data-mode-not-public', checked: 0, sent: 0 };
+        const lookback = new Date(now.getTime() - 21 * 86400000);
+        const metas = await SupremeLeagueMeta.find({
+          settlementStatus: 'settled',
+          settledAt: { $gte: lookback },
+          entryMode: { $ne: 'free-all' },
+          cadence: { $ne: 'clash-captains' },
+        }).sort({ settledAt: -1 }).limit(missedWinCompetitionLimit).lean();
+        let checked = 0;
+        let sent = 0;
+        let skipped = 0;
+        for (const meta of metas) {
+          const league = await League.findById(meta.leagueId).select('_id name startGameweek endGameweek displayedPrizeCents projectedPrizeCents').lean();
+          if (!league) continue;
+          const winner = await LeagueEntry.findOne({
+            leagueId: meta.leagueId,
+            paymentStatus: 'paid',
+            eligibilityStatus: { $ne: 'ineligible' },
+            scoreSyncStatus: 'success',
+          }).sort({ currentScore: -1, latestOverallRank: 1 }).select('currentScore').lean();
+          const winningScore = Number(winner?.currentScore || 0);
+          if (!winningScore) continue;
+          const entrantUserIds = await LeagueEntry.find({ leagueId: meta.leagueId, paymentStatus: 'paid' }).distinct('userId');
+          const users = await User.find({
+            role: 'user', status: 'active', email: { $exists: true, $ne: '' }, fplManagerId: { $exists: true, $nin: ['', null] },
+            _id: { $nin: entrantUserIds },
+          }).select('_id fullName email fplManagerId').limit(missedWinUserLimit).lean();
+          for (const user of users) {
+            checked += 1;
+            const eventKey = `missed-win:${meta._id}:${user._id}`;
+            if (await GrowthEmailNotification.exists({ eventKey })) { skipped += 1; continue; }
+            if (!(await userEmailNotificationsAllowed(user._id, 'results'))) { skipped += 1; continue; }
+            try {
+              const hypotheticalScore = await managerPoints(user.fplManagerId, meta.startGameweek, meta.endGameweek);
+              if (Number(hypotheticalScore) <= winningScore) {
+                await GrowthEmailNotification.create({
+                  eventKey,
+                  userId: user._id,
+                  recipientEmail: user.email,
+                  category: 'missed-win-check',
+                  subject: `Missed-win evaluation — ${league.name}`,
+                  status: 'skipped',
+                  attempts: 1,
+                  metadata: { leagueId: String(meta.leagueId), metaId: String(meta._id), hypotheticalScore, winningScore, reason: 'did-not-beat-winning-score' },
+                }).catch(() => null);
+                continue;
+              }
+              const prizeCents = Number(meta.prizeCents || league.displayedPrizeCents || league.projectedPrizeCents || 0);
+              const result = await sendEmail({
+                eventKey,
+                userId: user._id,
+                to: user.email,
+                category: 'missed-win',
+                subject: `Your FPL score would have won ${league.name}`,
+                preheader: `You scored ${hypotheticalScore}; the winning score was ${winningScore}.`,
+                title: 'You would have finished first',
+                tone: 'brand',
+                message: `<p style="margin:0 0 14px;">Hi ${htmlEscape(user.fullName || 'there')}, you did not enter <strong>${htmlEscape(league.name)}</strong>, but your official FPL score across Gameweeks ${meta.startGameweek}–${meta.endGameweek} was <strong>${hypotheticalScore}</strong>.</p><p style="margin:0;">The winning score was <strong>${winningScore}</strong>${prizeCents ? ` for a ${money(prizeCents)} prize` : ''}. Based on those recorded scores, you would have finished first if you had entered before the deadline.</p>`,
+                buttonLabel: 'See upcoming Supreme leagues',
+                buttonUrl: `${appUrl}/app/leagues/supreme`,
+                details: [
+                  { label: 'Your hypothetical score', value: String(hypotheticalScore) },
+                  { label: 'Winning score', value: String(winningScore) },
+                  { label: 'Competition', value: league.name },
+                ],
+                metadata: { leagueId: String(meta.leagueId), metaId: String(meta._id), hypotheticalScore, winningScore },
+              });
+              if (result?.skipped || result?.error) skipped += 1; else sent += 1;
+            } catch (error) {
+              skipped += 1;
+              console.warn(`Missed-winner check failed for user ${user._id} league ${meta.leagueId}:`, error.message);
+            }
+          }
+        }
+        return { checked, sent, skipped, competitions: metas.length };
+      }
+
       async function sendScheduledUserEmails(now = new Date()) {
         const result = {
           accountSetup: { checked: 0, sent: 0, skipped: 0 },
           leagueDeadlines: { checked: 0, sent: 0, skipped: 0 },
           gameweek: { checked: 0, sent: 0, skipped: 0 },
           subscriptionLapse: { checked: 0, sent: 0, skipped: 0 },
+          missedWins: { checked: 0, sent: 0, skipped: 0 },
         };
         result.accountSetup = await sendAccountSetupReminders(now);
         result.leagueDeadlines = await sendLeagueJoinDeadlineReminders(now);
         result.gameweek = await sendGameweekDeadlineReminders(now);
         result.subscriptionLapse = await sendSubscriptionLapseReminders(now);
+        result.missedWins = await sendMissedWinnerEmails(now);
         return result;
       }
 
@@ -7445,6 +7706,8 @@ const localGrowth = (() => {
             label: `Gameweeks ${gw}-${Math.min(gw + 1, 38)}`,
             startGameweek: gw, endGameweek: Math.min(gw + 1, 38),
             prizeCents: cents(process.env.SUPREME_BIWEEKLY_PRIZE_CENTS, 1500),
+            entryFeeCents: cents(process.env.SUPREME_BIWEEKLY_ENTRY_FEE_CENTS, 300),
+            entryMode: 'one-off-flex',
           });
         }
 
@@ -7548,6 +7811,23 @@ const localGrowth = (() => {
               'The competition closes only when FPL marks the gameweek finished and every fixture is finished.',
               'Prizes are paid after FPL marks the gameweek data_checked.',
               'If the highest Clash score is tied, the tied player with the best FPL overall rank for that gameweek wins the full published prize.',
+            ],
+          };
+        }
+        const isBiWeeklyFlex = def.entryMode === 'one-off-flex' && def.cadence === 'bi-weekly';
+        if (isBiWeeklyFlex) {
+          return {
+            name: `Supreme bi-weekly — ${def.periodLabel}`,
+            description: `Official bi-weekly Supreme competition for ${def.periodLabel}. Join with an eligible subscription or pay ${money(def.entryFeeCents)} one-off. The guaranteed prize is ${money(def.prizeCents)}.`,
+            competitionType: 'best-of-three',
+            ruleType: 'bi-weekly-entry',
+            rules: [
+              `Join with an eligible subscription or pay ${money(def.entryFeeCents)} for this bi-weekly competition.`,
+              'New entries close at the official FPL deadline for the first gameweek.',
+              'The competition closes only after FPL marks both included gameweeks finished and every fixture is finished.',
+              'Prizes are paid after FPL marks the included gameweeks data_checked.',
+              'Standings use qualifying FPL points across both gameweeks.',
+              'If first place is tied, the published prize is split fairly among all tied winners.',
             ],
           };
         }
@@ -8299,9 +8579,9 @@ const localGrowth = (() => {
               const myEntry = entryMap.get(String(meta.leagueId)) || null;
               const deadlineAt = meta.joinDeadlineAt ? new Date(meta.joinDeadlineAt) : null;
               const joined = myEntry?.paymentStatus === 'paid';
-              const weeklyPaidEntry = meta.entryMode === 'weekly-flex' || (meta.cadence === 'weekly' && Number(league?.entryFeeCents ?? meta.entryFeeCents ?? 0) > 0);
+              const oneOffPaidEntry = ['weekly-flex', 'one-off-flex'].includes(meta.entryMode) || (['weekly', 'bi-weekly'].includes(meta.cadence) && Number(league?.entryFeeCents ?? meta.entryFeeCents ?? 0) > 0);
               const joinOpen = Boolean(
-                weeklyPaidEntry
+                oneOffPaidEntry
                 && !joined
                 && deadlineAt
                 && deadlineAt > now
@@ -8322,7 +8602,7 @@ const localGrowth = (() => {
                 scoringFinalized: Boolean(meta.dataCheckedAt || league?.fplDataCheckedAt || meta.settlementStatus === 'settled'),
                 includedWithSubscription: Boolean(joined && /included with active subscription/i.test(myEntry?.eligibilityReason || '')),
                 freeEntry: meta.entryMode === 'free-all',
-                paymentOptions: weeklyPaidEntry ? ['subscription', 'one-off'] : (meta.entryMode === 'free-all' ? ['free'] : ['subscription']),
+                paymentOptions: oneOffPaidEntry ? ['subscription', 'one-off'] : (meta.entryMode === 'free-all' ? ['free'] : ['subscription']),
                 scoringMode: meta.scoringMode || 'manager-points',
                 teamLinked: Boolean(req.user.fplManagerId),
                 tieRule: meta.scoringMode === 'captain-vice'
@@ -8362,6 +8642,7 @@ const localGrowth = (() => {
         startTimers,
         sendEmail,
         sendScheduledUserEmails,
+        sendMissedWinnerEmails,
       };
     }
     
