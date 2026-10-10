@@ -121,6 +121,7 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
     const profile = await UserProfile.findOne({ userId }).select('notificationPreferences').lean();
     const preferences = profile?.notificationPreferences || {};
     if (preferences.emailNotifications === false) return false;
+    if (category === 'marketing') return preferences.marketing === true;
     if (category === 'league' && preferences.leagueReminders === false) return false;
     if (category === 'result' && preferences.results === false) return false;
     if (category === 'team-reminder' && preferences.deadlineReminders === false) return false;
@@ -150,7 +151,8 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
     if (user?._id && !bypassPreferences && !(await preferenceAllows(user._id, category))) return { skipped: true, reason: 'preference' };
 
     const existing = await EmailNotification.findOne({ dedupeKey }).lean();
-    if (existing?.status === 'sent' || existing?.status === 'sending' || existing?.attempts >= 3) return existing;
+    if (existing?.status === 'sent' || existing?.attempts >= 3) return existing;
+    if (existing?.status === 'sending' && new Date(existing.updatedAt || 0) > new Date(Date.now() - 15 * 60 * 1000)) return existing;
 
     const notification = await EmailNotification.findOneAndUpdate(
       { dedupeKey },
@@ -245,20 +247,97 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
     });
   }
 
-  async function notifyOwnerFailedSignup({ email, reason, attemptId }) {
+  // No password, phone number, date of birth or submitted form body is stored.
+  // One alert per email/reason/hour prevents an attacker spamming the owner inbox.
+  async function notifyOwnerSignupFailure({ email, reason, requestId } = {}) {
+    if (!ADMIN_NOTIFICATION_EMAIL) return { skipped: true, reason: 'admin-notification-email-not-configured' };
+    const safeEmail = normalizeEmail(email || '').slice(0, 254);
+    const safeReason = String(reason || 'Unknown signup failure').slice(0, 140);
+    const bucket = new Date().toISOString().slice(0, 13);
+    const fingerprint = crypto.createHash('sha256').update(`${safeEmail}:${safeReason}:${bucket}`).digest('hex').slice(0, 20);
+    return sendBrandedEmail({
+      recipientEmail: ADMIN_NOTIFICATION_EMAIL,
+      bypassPreferences: true,
+      eventType: 'operations.signup-failed',
+      dedupeKey: `operations-signup-failed:${fingerprint}:${bucket}`,
+      subject: 'A Supreme registration attempt did not complete',
+      eyebrow: 'Registration diagnostic',
+      title: 'A signup attempt failed',
+      intro: 'An attempted registration was rejected or encountered an error. No user account should be assumed to exist from this alert.',
+      content: detailRows([
+        { label: 'Supplied email', value: safeEmail || 'Not supplied' },
+        { label: 'Reason', value: safeReason },
+        { label: 'Request ID', value: String(requestId || 'Not available').slice(0, 100) },
+        { label: 'Time (UTC)', value: new Date().toISOString() },
+      ]),
+      actionLabel: 'Review users',
+      actionUrl: appLink('/admin/users'),
+      metadata: { reason: safeReason, requestId: String(requestId || '') },
+    });
+  }
+
+  async function sendTestAdminEmail() {
     if (!ADMIN_NOTIFICATION_EMAIL) return { skipped: true, reason: 'admin-notification-email-not-configured' };
     return sendBrandedEmail({
       recipientEmail: ADMIN_NOTIFICATION_EMAIL,
       bypassPreferences: true,
-      eventType: 'operations.failed-signup',
-      dedupeKey: `operations-failed-signup:${attemptId}`,
-      subject: 'Failed Supreme registration attempt',
-      eyebrow: 'Registration issue',
-      title: 'A signup attempt was unsuccessful',
-      intro: 'A registration request did not complete successfully.',
-      content: detailRows([{ label: 'Email', value: email || '(not provided)' }, { label: 'Reason', value: reason || 'Unknown' }]),
-      actionLabel: 'Open admin',
+      eventType: 'operations.email-test',
+      dedupeKey: `operations-email-test:${Date.now()}:${crypto.randomBytes(5).toString('hex')}`,
+      subject: 'Supreme operations email channel test',
+      eyebrow: 'Admin email check',
+      title: 'Operations notification test',
+      intro: 'This confirms that the backend can submit an email to your configured operations inbox through Resend.',
+      content: detailRows([
+        { label: 'Inbox', value: ADMIN_NOTIFICATION_EMAIL },
+        { label: 'Sender', value: SENDING_EMAIL },
+        { label: 'Time', value: new Date().toISOString() },
+      ]),
+      actionLabel: 'Review administration',
       actionUrl: appLink('/admin'),
+      footerNote: 'An accepted Resend API message does not guarantee inbox delivery. Check the mailbox and Resend activity logs.',
+    });
+  }
+
+  async function notifyOwnerLeagueSettlement(league, winnerCount, prizeCents) {
+    if (!ADMIN_NOTIFICATION_EMAIL || !league) return { skipped: true };
+    return sendBrandedEmail({
+      recipientEmail: ADMIN_NOTIFICATION_EMAIL,
+      bypassPreferences: true,
+      eventType: 'operations.league-settled',
+      dedupeKey: `operations-league-settled:${league._id}`,
+      subject: `League settled: ${league.name}`,
+      eyebrow: 'Competition settlement',
+      title: 'League settlement completed',
+      intro: `The platform has marked ${league.name} as settled. Review the credited prize transactions and final standings.`,
+      content: detailRows([
+        { label: 'League', value: league.name },
+        { label: 'Winners', value: winnerCount },
+        { label: 'Total credited prizes', value: formatUsd(prizeCents) },
+        { label: 'League ID', value: league._id },
+      ]),
+      actionLabel: 'Review settlement',
+      actionUrl: appLink(`/admin/leagues/${league._id}`),
+      metadata: { leagueId: league._id, winnerCount, prizeCents },
+    });
+  }
+
+  async function sendMarketingEmail(campaign, user) {
+    if (!campaign || !user) return { skipped: true };
+    const text = escapeHtml(String(campaign.message || '')).replace(/\n/g, '<br>');
+    return sendBrandedEmail({
+      user,
+      eventType: 'marketing.campaign',
+      category: 'marketing',
+      dedupeKey: `marketing-campaign:${campaign._id}:${user._id}`,
+      subject: campaign.subject,
+      eyebrow: 'Supreme news and offers',
+      title: campaign.headline,
+      intro: String(campaign.preheader || 'Latest news from Supreme Fantasy League'),
+      content: `<p style="line-height:1.75;white-space:normal;">${text}</p>`,
+      actionLabel: 'Explore competitions',
+      actionUrl: appLink('/app/leagues/supreme'),
+      footerNote: 'You opted in to promotional email. Turn off Marketing in your Supreme profile to stop these messages.',
+      metadata: { campaignId: campaign._id },
     });
   }
 
@@ -828,10 +907,14 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
     enabled: EMAILS_ENABLED,
     reminderCheckIntervalMs: REMINDER_CHECK_INTERVAL_MS,
     EmailNotification,
+    emailHealth: () => ({ enabled: EMAILS_ENABLED, senderConfigured: Boolean(RESENDER_API_KEY && SENDING_EMAIL), adminInboxConfigured: Boolean(ADMIN_NOTIFICATION_EMAIL), category: 'Resend' }),
     notifyWelcome: safeNotification('notifyWelcome', notifyWelcome),
     notifyAdminWelcome: safeNotification('notifyAdminWelcome', notifyAdminWelcome),
     notifyOwnerUserSignup: safeNotification('notifyOwnerUserSignup', notifyOwnerUserSignup),
-    notifyOwnerFailedSignup: safeNotification('notifyOwnerFailedSignup', notifyOwnerFailedSignup),
+    notifyOwnerSignupFailure: safeNotification('notifyOwnerSignupFailure', notifyOwnerSignupFailure),
+    notifyOwnerLeagueSettlement: safeNotification('notifyOwnerLeagueSettlement', notifyOwnerLeagueSettlement),
+    sendMarketingEmail: safeNotification('sendMarketingEmail', sendMarketingEmail),
+    sendTestAdminEmail: safeNotification('sendTestAdminEmail', sendTestAdminEmail),
     notifyOwnerAdminSignup: safeNotification('notifyOwnerAdminSignup', notifyOwnerAdminSignup),
     notifyPaymentUpdate: safeNotification('notifyPaymentUpdate', notifyPaymentUpdate),
     notifyOwnerWithdrawalRequest: safeNotification('notifyOwnerWithdrawalRequest', notifyOwnerWithdrawalRequest),

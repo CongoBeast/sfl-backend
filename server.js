@@ -12,6 +12,8 @@ const cookieParser = require('cookie-parser');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const { isClashOfCaptains, pricingForLeague, compareClashEntries } = require('./competition-policy');
+const { externalCashInMatch, getCashAccounting } = require('./cash-accounting');
 
 const app = express();
 const PORT = Number(process.env.PORT || 8000);
@@ -703,6 +705,21 @@ const supportTicketSchema = new Schema({
   closedAt: { type: Date, default: null },
   lastActivityAt: { type: Date, default: Date.now },
 }, { timestamps: true });
+
+const marketingCampaignSchema = new Schema({
+  subject: { type: String, required: true, trim: true, maxlength: 160 },
+  headline: { type: String, required: true, trim: true, maxlength: 160 },
+  preheader: { type: String, default: '', trim: true, maxlength: 240 },
+  message: { type: String, required: true, trim: true, maxlength: 4000 },
+  status: { type: String, enum: ['draft', 'active', 'paused', 'completed'], default: 'draft', index: true },
+  scheduledAt: { type: Date, default: Date.now },
+  cursorProfileId: { type: Schema.Types.ObjectId, default: null },
+  sentCount: { type: Number, default: 0 },
+  skippedCount: { type: Number, default: 0 },
+  completedAt: { type: Date, default: null },
+  createdBy: { type: Schema.Types.ObjectId, ref: 'User' },
+}, { timestamps: true });
+const MarketingCampaign = mongoose.model('MarketingCampaign', marketingCampaignSchema);
 
 const User = mongoose.model('User', userSchema);
 const UserProfile = mongoose.model('UserProfile', userProfileSchema);
@@ -2351,30 +2368,35 @@ async function getEarningsLeaderboard(currentUserId, limit = 10) {
   }));
 }
 
-// Whether a league is genuinely free-for-everyone (currently only Clash of
-// the Captains). This is NOT the same as entryFeeCents === 0: Bi-weekly,
-// Monthly, Half-season and Season Supreme leagues also default to
-// entryFeeCents 0 (they simply have no one-off cash price — they're
-// subscription-gated instead), so entryFeeCents alone cannot be used to
-// decide this. The authoritative signal is SupremeLeagueMeta.entryMode,
-// which is 'free-all' only for Clash of the Captains.
-async function isFreeForAllLeague(league) {
-  if (!league?.officialSupremeLeague) return false;
+// Clash is the only publicly free Supreme competition. Zero one-off fee on
+// a monthly/season league means a paid subscription is required, not free entry.
+async function getLeaguePricing(league, givenMeta = undefined) {
   const SupremeLeagueMetaModel = mongoose.models.SupremeLeagueMeta;
-  if (!SupremeLeagueMetaModel) return false;
-  const meta = await SupremeLeagueMetaModel.findOne({ leagueId: league._id }).select('entryMode cadence').lean();
-  return meta?.entryMode === 'free-all' && meta?.cadence === 'clash-captains' && league.competitionType === 'clash-captains';
+  const meta = givenMeta === undefined && league?.officialSupremeLeague && SupremeLeagueMetaModel
+    ? await SupremeLeagueMetaModel.findOne({ leagueId: league._id }).lean()
+    : (givenMeta || null);
+  return pricingForLeague(league, meta, {
+    monthly: canonicalPlanAmountCents(PLANS.monthly),
+    'bi-weekly': canonicalPlanAmountCents(PLANS.plus),
+    weekly: canonicalPlanAmountCents(PLANS.halfSeason),
+    'half-season': canonicalPlanAmountCents(PLANS.halfSeason),
+    season: canonicalPlanAmountCents(PLANS.season),
+  });
+}
+
+async function isFreeForAllLeague(league) {
+  return (await getLeaguePricing(league)).freeEntry;
 }
 
 async function leagueView(league, userId = null) {
   // Keep list/detail reads DB-only and parallel. Live FPL work is deliberately
   // handled by the page's automatic refresh request after cached content renders.
-  const [participantCount, reservedCount, entry, accessPolicy, freeEntry] = await Promise.all([
+  const [participantCount, reservedCount, entry, accessPolicy, pricing] = await Promise.all([
     LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: 'paid' }),
     LeagueEntry.countDocuments({ leagueId: league._id, paymentStatus: { $in: ['paid', 'pending'] } }),
     userId ? LeagueEntry.findOne({ leagueId: league._id, userId }).lean() : Promise.resolve(null),
     localGrowth.getLeagueAccessPolicy(league._id),
-    isFreeForAllLeague(league),
+    getLeaguePricing(league),
   ]);
   const grossPoolCents = participantCount * league.entryFeeCents;
   const platformFeeCents = league.customLeague ? Math.round(grossPoolCents * league.platformFeeBasisPoints / 10000) : 0;
@@ -2411,7 +2433,7 @@ async function leagueView(league, userId = null) {
     endGameweek: league.endGameweek,
     currentGameweek: league.currentGameweek,
     entryFeeCents: league.entryFeeCents,
-    freeEntry,
+    ...pricing,
     participantCount,
     reservedCount,
     grossPoolCents,
@@ -2440,7 +2462,7 @@ async function leagueView(league, userId = null) {
     isPast: leagueIsPast(league),
     joined,
     entry,
-    canPayEntry: Boolean(entry && entry.paymentStatus !== 'paid' && !leagueIsPast(league) && ['draft', 'open', 'upcoming'].includes(league.status)),
+    canPayEntry: Boolean(pricing.oneOffAllowed && entry && entry.paymentStatus !== 'paid' && !leagueIsPast(league) && ['draft', 'open', 'upcoming'].includes(league.status)),
   };
 }
 
@@ -2599,18 +2621,11 @@ function normalizedMarketingAttribution(raw = {}) {
   };
 }
 
-app.post('/api/auth/register', authLimiter, (req, res, next) => {
-  // Observe validation/database failures without logging credentials or full request bodies.
-  res.once('finish', () => {
-    if (res.statusCode < 400) return;
-    emailService.notifyOwnerFailedSignup({
-      email: normalizeEmail(req.body?.email || '').slice(0, 120),
-      reason: `Registration returned HTTP ${res.statusCode}`,
-      attemptId: createReference('SIGNUP-FAILED'),
-    }).catch((error) => console.error('Signup failure alert:', error.message));
-  });
-  next();
-}, async (req, res, next) => {
+app.post('/api/auth/register', authLimiter, async (req, res, next) => {
+  const rejectSignup = async (status, message, details = []) => {
+    await emailService.notifyOwnerSignupFailure({ email: req.body?.email, reason: message, requestId: req.requestId });
+    return failure(res, status, message, details);
+  };
   try {
     const { fullName, email, phone, dateOfBirth, password, confirmPassword, ageConfirmed, termsAccepted, privacyAccepted, rulesAccepted, securityAcknowledged } = req.body;
     const errors = [];
@@ -2620,17 +2635,16 @@ app.post('/api/auth/register', authLimiter, (req, res, next) => {
     if (!password || password.length < 8) errors.push('Password must be at least 8 characters.');
     if (password !== confirmPassword) errors.push('Passwords do not match.');
     if (!termsAccepted || !privacyAccepted || !rulesAccepted || !securityAcknowledged) errors.push('Terms, Privacy, Competition Rules and the account-security acknowledgement are required.');
-    if (errors.length) return failure(res, 400, 'Registration validation failed.', errors);
+    if (errors.length) return rejectSignup(400, 'Registration validation failed.', errors);
 
     const normalized = normalizeEmail(email);
-    if (!/^\S+@\S+\.\S+$/.test(normalized)) return failure(res, 400, 'Enter a valid email address.');
-    if (await User.exists({ email: normalized })) return failure(res, 409, 'An account with this email already exists.');
+    if (!/^\S+@\S+\.\S+$/.test(normalized)) return rejectSignup(400, 'Enter a valid email address.');
+    if (await User.exists({ email: normalized })) return rejectSignup(409, 'An account with this email already exists.');
 
     const referralCode = String(req.body.referralCode || '')
       .trim()
       .toUpperCase()
       .replace(/[^A-Z0-9]/g, '');
-    // Referral codes are always optional. An invalid optional code must not block registration.
     const validReferralCode = referralCode && await localGrowth.models.ReferralAccount.exists({ code: referralCode }) ? referralCode : '';
 
     const passwordHash = await bcrypt.hash(password, 12);
@@ -2658,10 +2672,13 @@ app.post('/api/auth/register', authLimiter, (req, res, next) => {
     const token = signToken(user);
     setSessionCookie(res, token);
     await logAudit(req, 'auth.register', 'User', user._id, null, { email: user.email, termsVersion: LEGAL_TERMS_VERSION, privacyVersion: LEGAL_PRIVACY_VERSION, rulesVersion: LEGAL_RULES_VERSION }, 'User registration and legal acceptance');
-    await Promise.all([emailService.notifyWelcome(user), emailService.notifyOwnerUserSignup(user)]);
-    await localGrowth.ensureReferralAccount(user, validReferralCode);
-    return success(res, { user: publicUser(user, profile) }, 201);
-  } catch (error) { next(error); }
+    // Email and optional referral failures must never undo a successfully created account.
+    await Promise.allSettled([emailService.notifyWelcome(user), emailService.notifyOwnerUserSignup(user), localGrowth.ensureReferralAccount(user, validReferralCode)]);
+    return success(res, { user: publicUser(user, profile), invalidReferralCodeIgnored: Boolean(referralCode && !validReferralCode) }, 201);
+  } catch (error) {
+    await emailService.notifyOwnerSignupFailure({ email: req.body?.email, reason: `Unexpected registration error: ${String(error.code || error.name || 'unknown')}`, requestId: req.requestId });
+    next(error);
+  }
 });
 
 app.post('/api/auth/login', authLimiter, async (req, res, next) => {
@@ -3266,6 +3283,7 @@ async function scoreManagerForLeague(managerId, league, scoreThroughGameweek) {
       details: {
         scoringMode: 'captain-vice-raw-points',
         gameweek,
+        overallPoints: Number(picks.entryHistory?.total_points ?? 0),
         captain: { elementId: captain.elementId, name: captain.name, points: Number(captain.points || 0) },
         viceCaptain: { elementId: viceCaptain.elementId, name: viceCaptain.name, points: Number(viceCaptain.points || 0) },
       },
@@ -3385,6 +3403,10 @@ async function syncLeagueScores(leagueId, { force = false } = {}) {
       latestOverallRank: 1,
       joinedAt: 1,
     });
+    if (league.officialSupremeLeague && league.competitionType === 'clash-captains') {
+      const clashMeta = await mongoose.models.SupremeLeagueMeta.findOne({ leagueId: league._id }).lean();
+      if (isClashOfCaptains(clashMeta, league)) rankedEntries.sort(compareClashEntries);
+    }
     for (let index = 0; index < rankedEntries.length; index += 1) {
       rankedEntries[index].currentRank = index + 1;
       await rankedEntries[index].save();
@@ -3874,6 +3896,11 @@ async function getLeagueLeaderboard(leagueId, currentUserId) {
     .sort({ currentScore: -1, latestOverallRank: 1, joinedAt: 1 })
     .populate('userId', 'fullName fantasyTeamName fplManagerId')
     .lean();
+  const rankingLeague = await League.findById(leagueId).select('officialSupremeLeague competitionType').lean();
+  if (rankingLeague?.officialSupremeLeague && rankingLeague.competitionType === 'clash-captains') {
+    const clashMeta = await mongoose.models.SupremeLeagueMeta.findOne({ leagueId }).lean();
+    if (isClashOfCaptains(clashMeta, rankingLeague)) entries.sort(compareClashEntries);
+  }
   const userIds = entries.map((entry) => entry.userId?._id).filter(Boolean);
   const [profiles, snapshots] = await Promise.all([
     UserProfile.find({ userId: { $in: userIds } }).select('userId profilePicture').lean(),
@@ -4791,6 +4818,7 @@ async function createPaynowPaymentRecord({ req, type, amountCents, method, phone
     metadata: {
       method,
       phone: normalizeZimbabwePhone(phone),
+      paynowTestMode: Boolean(PAYNOW_TEST_MODE || MOCK_PAYMENTS),
       purpose: type === 'entry-fee' ? 'league-entry' : type,
       planCode: plan?.planCode || '',
       subscriptionId: subscription?._id || null,
@@ -5184,7 +5212,10 @@ async function dashboardSupremeOffers(userId, limit = 8) {
     ? await LeagueEntry.find({ leagueId: { $in: leagueIds }, userId }).select('leagueId paymentStatus').lean()
     : [];
   const joined = new Map(entries.map((entry) => [String(entry.leagueId), entry.paymentStatus]));
-  return leagues.map((league) => ({
+  const metaModel = mongoose.models.SupremeLeagueMeta;
+  const metas = metaModel ? await metaModel.find({ leagueId: { $in: leagueIds } }).lean() : [];
+  const metasByLeague = new Map(metas.map((meta) => [String(meta.leagueId), meta]));
+  return Promise.all(leagues.map(async (league) => ({
     id: league._id,
     name: league.name,
     description: league.description,
@@ -5192,13 +5223,14 @@ async function dashboardSupremeOffers(userId, limit = 8) {
     startGameweek: league.startGameweek,
     endGameweek: league.endGameweek,
     entryFeeCents: Number(league.entryFeeCents || 0),
+    ...(await getLeaguePricing(league, metasByLeague.get(String(league._id)) || null)),
     prizeCents: (league.cadence || league.competitionType) === 'clash-captains'
       ? nonNegativeIntegerFromEnv('SUPREME_CLASH_CAPTAINS_PRIZE_CENTS', 300)
       : Number(league.displayedPrizeCents || 0),
     joinDeadlineAt: league.fplJoinDeadlineAt,
     status: league.status,
     joined: joined.get(String(league._id)) === 'paid',
-  }));
+  })));
 }
 
 function cachedDashboardGameState(team, offers) {
@@ -5431,19 +5463,21 @@ function parseAdminAnalyticsRange(req) {
 }
 
 function adminCashInMatch() {
-  return {
-    status: 'completed',
-    provider: { $in: ['paynow', 'mock'] },
-    type: { $in: ['deposit', 'subscription', 'entry-fee'] },
-    direction: 'credit',
-  };
+  return externalCashInMatch();
 }
 
 function adminRevenueMatch() {
+  // Purchase transactions are debits to the player's account. The older
+  // credit-only filter silently omitted subscription and one-off revenue.
+  // Platform-fee transfers (where present) are separate credit records.
   return {
     status: 'completed',
-    type: { $in: ['subscription', 'entry-fee', 'platform-fee'] },
-    direction: 'credit',
+    provider: { $ne: 'mock' },
+    'metadata.paynowTestMode': { $ne: true },
+    $or: [
+      { type: { $in: ['subscription', 'entry-fee'] }, direction: 'debit' },
+      { type: 'platform-fee', direction: 'credit' },
+    ],
   };
 }
 
@@ -5466,30 +5500,6 @@ function nextAdminBucket(date, groupBy) {
   const value = new Date(date);
   if (groupBy === 'month') return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth() + 1, 1));
   return new Date(value.getTime() + (groupBy === 'week' ? 7 : 1) * 86400000);
-}
-
-// External funds are counted once on the successfully completed payment ledger.
-// Internal wallet entry fees/prizes are not additional external inflows/outflows.
-async function getAdminCashAccounting() {
-  const now = new Date();
-  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-  const lastMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
-  const moneyTransactions = await Transaction.aggregate([
-    { $match: { status: 'completed', $or: [
-      { type: { $in: ['deposit', 'subscription', 'entry-fee'] }, provider: 'paynow', direction: 'credit' },
-      { type: 'withdrawal', direction: 'debit' },
-    ] } },
-    { $project: { amountCents: 1, type: 1, date: { $ifNull: ['$metadata.paidAt', { $ifNull: ['$metadata.finalizedAt', '$updatedAt'] }] }, isPayout: { $eq: ['$type', 'withdrawal'] } } },
-    { $group: { _id: { payout: '$isPayout', period: { $cond: [{ $gte: ['$date', monthStart] }, 'current', { $cond: [{ $gte: ['$date', lastMonthStart] }, 'previous', 'older'] }] } }, cents: { $sum: '$amountCents' }, count: { $sum: 1 } } },
-  ]);
-  const result = { lifetime: { collectedCents: 0, paidOutCents: 0 }, thisMonth: { collectedCents: 0, paidOutCents: 0 }, lastMonth: { collectedCents: 0, paidOutCents: 0 } };
-  for (const bucket of moneyTransactions) {
-    const key = bucket._id.payout ? 'paidOutCents' : 'collectedCents';
-    result.lifetime[key] += bucket.cents;
-    if (bucket._id.period === 'current') result.thisMonth[key] += bucket.cents;
-    if (bucket._id.period === 'previous') result.lastMonth[key] += bucket.cents;
-  }
-  return result;
 }
 
 async function getAdminDashboardAnalytics(req) {
@@ -5587,7 +5597,7 @@ async function getAdminDashboardAnalytics(req) {
     },
     series,
     definitions: {
-      cashIn: 'Completed external Paynow/mock deposits, subscriptions and league entries. Wallet-funded purchases are excluded so they are not counted twice.',
+      cashIn: 'Only completed real Paynow receipts for deposits, subscriptions and league entries. Test/mock charges and wallet-funded purchases are excluded.',
       revenue: 'Completed subscription, league-entry and platform-fee transactions, including wallet-funded purchases.',
     },
   };
@@ -5764,7 +5774,7 @@ app.get('/api/admin/session', requireAdmin, (req, res) => success(res, { admin: 
 app.get('/api/admin/dashboard', requireAdmin, async (req, res, next) => {
   try {
     const monthStart = new Date(); monthStart.setUTCDate(1); monthStart.setUTCHours(0, 0, 0, 0);
-    const [users, newUsers, activeSubscriptions, usersInLeagues, leagueGroups, activeLeagues, finance, openTickets, analytics, cashAccounting, recentTransactions] = await Promise.all([
+    const [users, newUsers, activeSubscriptions, usersInLeagues, leagueGroups, activeLeagues, finance, openTickets, analytics, cashAccounting, recentTransactions, missingWalletCount] = await Promise.all([
       User.countDocuments({ role: 'user' }),
       User.countDocuments({ role: 'user', createdAt: { $gte: monthStart } }),
       Subscription.countDocuments({ status: 'active' }),
@@ -5774,8 +5784,9 @@ app.get('/api/admin/dashboard', requireAdmin, async (req, res, next) => {
       Transaction.aggregate([{ $match: { status: 'completed' } }, { $group: { _id: { type: '$type', direction: '$direction', provider: '$provider' }, amountCents: { $sum: '$amountCents' }, count: { $sum: 1 } } }]),
       SupportTicket.countDocuments({ status: { $nin: ['resolved', 'closed'] } }),
       getAdminDashboardAnalytics(req),
-      getAdminCashAccounting(),
-      Transaction.find({ type: { $in: ['deposit', 'subscription', 'entry-fee', 'withdrawal'] } }).sort({ createdAt: -1 }).limit(10).populate('userId', 'fullName email').select('type status amountCents createdAt direction provider userId reference').lean(),
+      getCashAccounting(Transaction),
+      Transaction.find({ type: { $in: ['deposit', 'subscription', 'entry-fee', 'withdrawal', 'refund', 'prize'] } }).sort({ createdAt: -1 }).limit(15).populate('userId', 'fullName email').select('type direction status amountCents provider reference createdAt updatedAt metadata.finalizedAt metadata.paidAt userId').lean(),
+      User.aggregate([{ $match: { role: 'user' } }, { $lookup: { from: Wallet.collection.name, localField: '_id', foreignField: 'userId', as: 'walletDocs' } }, { $match: { walletDocs: { $size: 0 } } }, { $count: 'count' }]).then((rows) => Number(rows[0]?.count || 0)),
     ]);
     const payoutsDueCents = await Transaction.aggregate([
       { $match: { type: { $in: ['withdrawal', 'prize'] }, status: { $in: ['pending', 'processing'] } } },
@@ -5801,6 +5812,7 @@ app.get('/api/admin/dashboard', requireAdmin, async (req, res, next) => {
       analytics,
       cashAccounting,
       recentTransactions,
+      missingWalletCount,
       openTickets,
     });
   } catch (error) { next(error); }
@@ -5809,6 +5821,120 @@ app.get('/api/admin/dashboard', requireAdmin, async (req, res, next) => {
 app.get('/api/admin/dashboard/analytics', requireAdmin, async (req, res, next) => {
   try {
     return success(res, await getAdminDashboardAnalytics(req));
+  } catch (error) { next(error); }
+});
+
+// Marketing campaigns are authored but never sent automatically until an admin
+// explicitly activates them. Each account must independently opt in on Profile.
+app.get('/api/admin/marketing/campaigns', requireAdmin, async (req, res, next) => {
+  try {
+    const [campaigns, optedInCount] = await Promise.all([
+      MarketingCampaign.find().sort({ createdAt: -1 }).limit(100).lean(),
+      UserProfile.countDocuments({ 'notificationPreferences.marketing': true, 'notificationPreferences.emailNotifications': { $ne: false } }),
+    ]);
+    return success(res, { campaigns, optedInCount, email: emailService.emailHealth() });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/admin/marketing/campaigns', requireAdmin, writeLimiter, async (req, res, next) => {
+  try {
+    const subject = String(req.body?.subject || '').trim();
+    const headline = String(req.body?.headline || '').trim();
+    const preheader = String(req.body?.preheader || '').trim();
+    const message = String(req.body?.message || '').trim();
+    if (!subject || !headline || !message || subject.length > 160 || headline.length > 160 || preheader.length > 240 || message.length > 4000) {
+      return failure(res, 400, 'A subject (max 160), headline (max 160) and message (max 4,000 characters) are required.');
+    }
+    const campaign = await MarketingCampaign.create({ subject, headline, preheader, message, createdBy: req.user._id, status: 'draft' });
+    await adminAudit(req, 'marketing.campaign.created', 'MarketingCampaign', campaign._id, { status: campaign.status });
+    return success(res, { campaign }, 201);
+  } catch (error) { next(error); }
+});
+
+app.patch('/api/admin/marketing/campaigns/:id', requireAdmin, writeLimiter, async (req, res, next) => {
+  try {
+    const status = String(req.body?.status || '');
+    if (!['active', 'paused'].includes(status)) return failure(res, 400, 'Choose active or paused.');
+    if (status === 'active' && (!emailService.emailHealth().enabled || !emailService.emailHealth().senderConfigured)) {
+      return failure(res, 503, 'Configure the email provider before activating marketing delivery.');
+    }
+    const campaign = await MarketingCampaign.findOneAndUpdate({ _id: req.params.id, status: { $in: ['draft', 'active', 'paused'] } }, { $set: { status } }, { new: true });
+    if (!campaign) return failure(res, 404, 'Campaign not found or already completed.');
+    await adminAudit(req, 'marketing.campaign.status', 'MarketingCampaign', campaign._id, { status });
+    return success(res, { campaign });
+  } catch (error) { next(error); }
+});
+
+// One-batch delivery, also invoked daily by scheduled maintenance. An admin can
+// send more batches manually (max 15 recipients per request). Per-recipient
+// sending uses a unique campaign+user delivery key so retries are idempotent.
+async function processMarketingCampaignBatch(batchSize = 15) {
+  if (!emailService.emailHealth().enabled) return { skipped: 'Email delivery disabled' };
+  const campaign = await MarketingCampaign.findOne({ status: 'active', scheduledAt: { $lte: new Date() } }).sort({ createdAt: 1 });
+  if (!campaign) return { skipped: 'No active campaigns' };
+  const where = {
+    'notificationPreferences.marketing': true,
+    'notificationPreferences.emailNotifications': { $ne: false },
+    ...(campaign.cursorProfileId ? { _id: { $gt: campaign.cursorProfileId } } : {}),
+  };
+  const profiles = await UserProfile.find(where).select('_id userId').sort({ _id: 1 }).limit(batchSize).lean();
+  let sent = 0;
+  let skipped = 0;
+  for (const profile of profiles) {
+    // Re-check campaign and consent at send time so an admin may pause it or a
+    // user may opt out between maintenance iterations.
+    const latest = await MarketingCampaign.findById(campaign._id).select('status').lean();
+    if (latest?.status !== 'active') return { campaignId: campaign._id, sent, skipped, paused: true };
+    const [user, consent] = await Promise.all([
+      User.findOne({ _id: profile.userId, role: 'user', status: 'active' }).select('_id email').lean(),
+      UserProfile.findById(profile._id).select('notificationPreferences').lean(),
+    ]);
+    if (user?.email && consent?.notificationPreferences?.marketing === true && consent?.notificationPreferences?.emailNotifications !== false) {
+      const result = await emailService.sendMarketingEmail(campaign, user);
+      if (result?.status === 'sent') sent += 1;
+      else if (result?.skipped === true && result.reason === 'preference') skipped += 1;
+      else {
+        // Never move the cursor past a failed, queued or in-flight delivery.
+        // Sending in progress can be retried after the email service's lease
+        // expires, without permanently missing the opted-in recipient.
+        await MarketingCampaign.updateOne({ _id: campaign._id }, { $inc: { sentCount: sent, skippedCount: skipped } });
+        return { campaignId: campaign._id, sent, skipped,
+          failed: result?.status === 'failed' ? result.error || 'Email provider error' : '',
+          retryRequired: true };
+      }
+    } else skipped += 1;
+    await MarketingCampaign.updateOne({ _id: campaign._id }, { $set: { cursorProfileId: profile._id } });
+  }
+  const completed = profiles.length < batchSize;
+  await MarketingCampaign.updateOne({ _id: campaign._id }, {
+    $inc: { sentCount: sent, skippedCount: skipped },
+    ...(completed ? { $set: { status: 'completed', completedAt: new Date() } } : {}),
+  });
+  return { campaignId: campaign._id, sent, skipped, completed, moreRemaining: !completed };
+}
+
+app.post('/api/admin/marketing/campaigns/run', requireAdmin, writeLimiter, async (req, res, next) => {
+  try { return success(res, await processMarketingCampaignBatch()); }
+  catch (error) { next(error); }
+});
+
+app.get('/api/admin/notifications/health', requireAdmin, async (req, res, next) => {
+  try {
+    const [recent, sentCount, failedCount] = await Promise.all([
+      emailService.EmailNotification.find().sort({ createdAt: -1 }).limit(20).select('recipient eventType status attempts error createdAt sentAt').lean(),
+      emailService.EmailNotification.countDocuments({ status: 'sent' }),
+      emailService.EmailNotification.countDocuments({ status: 'failed' }),
+    ]);
+    return success(res, { ...emailService.emailHealth(), sentCount, failedCount, recent });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/admin/notifications/test-admin-email', requireAdmin, writeLimiter, async (req, res, next) => {
+  try {
+    const notification = await emailService.sendTestAdminEmail();
+    await adminAudit(req, 'email.operations.test', 'EmailNotification', notification?._id || null,
+      { status: notification?.status || 'skipped', reason: notification?.reason || '' });
+    return success(res, { notification, instructions: 'Check the configured operations mailbox and Resend delivery logs.' });
   } catch (error) { next(error); }
 });
 
@@ -5897,6 +6023,7 @@ async function settleStandardLeagueFromAdmin(leagueId, { adminUserId, reason, fo
   if (verified.dataChecked) league.fplDataCheckedAt = league.fplDataCheckedAt || now;
   await league.save();
   await emailService.notifyLeagueOutcomes(league._id);
+  await emailService.notifyOwnerLeagueSettlement(league, winners.length, totalPrize);
   return { settled: true, winners: winners.length, prizeCents: totalPrize, manual: true };
 }
 
@@ -5908,8 +6035,8 @@ app.get('/api/admin/leagues', requireAdmin, async (req, res, next) => {
     if (req.query.status) filter.status = req.query.status;
     if (req.query.type) filter.competitionType = req.query.type;
     const [rows,total] = await Promise.all([League.find(filter).sort({ createdAt:-1 }).skip((page-1)*limit).limit(limit).lean(), League.countDocuments(filter)]);
-    const ids=rows.map(x=>x._id); const counts=await LeagueEntry.aggregate([{ $match:{leagueId:{$in:ids}}},{ $group:{_id:'$leagueId',members:{$sum:1}}}]); const map=new Map(counts.map(x=>[String(x._id),x.members]));
-    return success(res,{rows:rows.map(x=>({...x,memberCount:map.get(String(x._id))||0,expiresAt:x.expiresAt})),pagination:{page,limit,total,pages:Math.ceil(total/limit)}});
+    const ids=rows.map(x=>x._id); const metaModel=mongoose.models.SupremeLeagueMeta; const leagueMetas=metaModel?await metaModel.find({leagueId:{$in:ids}}).lean():[]; const metaMap=new Map(leagueMetas.map(m=>[String(m.leagueId),m])); const counts=await LeagueEntry.aggregate([{ $match:{leagueId:{$in:ids}}},{ $group:{_id:'$leagueId',members:{$sum:1}}}]); const map=new Map(counts.map(x=>[String(x._id),x.members]));
+    return success(res,{rows:rows.map(x=>({...x,...pricingForLeague(x,metaMap.get(String(x._id))||null,{monthly:PLANS.monthly.amountCents,'bi-weekly':PLANS.plus.amountCents,weekly:PLANS.halfSeason.amountCents,'half-season':PLANS.halfSeason.amountCents,season:PLANS.season.amountCents}),memberCount:map.get(String(x._id))||0,expiresAt:x.expiresAt})),pagination:{page,limit,total,pages:Math.ceil(total/limit)}});
   } catch(error){next(error);}
 });
 
@@ -5932,7 +6059,7 @@ app.get('/api/admin/leagues/:id', requireAdmin, async (req, res, next) => {
       LeagueEntry.find({ leagueId: req.params.id }).populate('userId', 'fullName email phone status fantasyTeamName').sort({ currentRank: 1, joinedAt: 1 }).lean(),
       getLeagueSettlementDiagnostics(req.params.id, { verifyLive: refreshRequested }),
     ]);
-    return success(res, { league, members, settlement, leaderboard: members.map((m) => ({ entryId: m._id, user: m.userId, rank: m.currentRank, score: m.currentScore, scoreDetails: m.scoreDetails || {}, prizeCents: m.prizeCents, payoutStatus: m.payoutStatus, joinedAt: m.joinedAt, eligibilityStatus: m.eligibilityStatus })) });
+    return success(res, { league: {...league, ...(await getLeaguePricing(league))}, members, settlement, leaderboard: members.map((m) => ({ entryId: m._id, user: m.userId, rank: m.currentRank, score: m.currentScore, scoreDetails: m.scoreDetails || {}, prizeCents: m.prizeCents, payoutStatus: m.payoutStatus, joinedAt: m.joinedAt, eligibilityStatus: m.eligibilityStatus })) });
   } catch (error) { next(error); }
 });
 
@@ -6061,11 +6188,30 @@ app.post('/api/admin/leagues/:id/members', requireAdmin, writeLimiter, async (re
 
 app.delete('/api/admin/leagues/:id/members/:userId', requireAdmin, writeLimiter, async(req,res,next)=>{try{const entry=await LeagueEntry.findOneAndDelete({leagueId:req.params.id,userId:req.params.userId}); if(!entry)return failure(res,404,'League member not found.'); await adminAudit(req,'league.member.removed','League',req.params.id,{userId:req.params.userId}); return success(res,{removed:true});}catch(error){next(error);}});
 
+// Safe, read-only review. Existing wrongly free entrants are not charged or
+// removed by a deployment; operators should investigate disputed entitlements.
+app.get('/api/admin/maintenance/free-entry-audit', requireAdmin, async (req, res, next) => {
+  try {
+    const entries = await LeagueEntry.find({ entrySource: 'free', paymentStatus: 'paid' }).select('leagueId userId createdAt').limit(5000).lean();
+    const ids = [...new Set(entries.map(e => String(e.leagueId)))];
+    const metaModel = mongoose.models.SupremeLeagueMeta;
+    const [leagues, metas] = await Promise.all([
+      League.find({ _id: { $in: ids } }).select('name competitionType cadence officialSupremeLeague entryFeeCents').lean(),
+      metaModel ? metaModel.find({ leagueId: { $in: ids } }).lean() : Promise.resolve([]),
+    ]);
+    const lm = new Map(leagues.map(l => [String(l._id), l]));
+    const mm = new Map(metas.map(m => [String(m.leagueId), m]));
+    const suspicious = entries.filter(e => !isClashOfCaptains(mm.get(String(e.leagueId)), lm.get(String(e.leagueId))))
+      .map(e => ({ entryId: e._id, leagueId: e.leagueId, leagueName: lm.get(String(e.leagueId))?.name || 'Missing league', userId: e.userId, joinedAt: e.createdAt }));
+    return success(res, { scanned: entries.length, suspiciousCount: suspicious.length, suspicious, truncated: entries.length === 5000, applied: false });
+  } catch (error) { next(error); }
+});
+
 app.get('/api/admin/users', requireAdmin, async(req,res,next)=>{try{
   const {page,limit}=pageOptions(req); const search=String(req.query.search||'').trim(); const filter={role:'user'}; if(search)filter.$or=[{fullName:new RegExp(escapeRegex(search),'i')},{email:new RegExp(escapeRegex(search),'i')},{phone:new RegExp(escapeRegex(search),'i')}]; if(req.query.status)filter.status=req.query.status;
   const [rows,total]=await Promise.all([User.find(filter).sort({createdAt:-1}).skip((page-1)*limit).limit(limit).lean(),User.countDocuments(filter)]); const ids=rows.map(x=>x._id);
   const [subs,entries,wallets]=await Promise.all([Subscription.find({userId:{$in:ids},status:'active'}).lean(),LeagueEntry.aggregate([{ $match:{userId:{$in:ids}}},{ $group:{_id:'$userId',count:{$sum:1}}}]),Wallet.find({userId:{$in:ids}}).lean()]);
-  const sm=new Map(subs.map(x=>[String(x.userId),x])); const em=new Map(entries.map(x=>[String(x._id),x.count])); const wm=new Map(wallets.map(x=>[String(x.userId),x])); return success(res,{rows:rows.map(u=>({...adminPublicUser(u),subscription:sm.get(String(u._id))||null,leagueCount:em.get(String(u._id))||0,wallet:wm.get(String(u._id))||null})),pagination:{page,limit,total,pages:Math.ceil(total/limit)}});
+  const sm=new Map(subs.map(x=>[String(x.userId),x])); const em=new Map(entries.map(x=>[String(x._id),x.count])); const wm=new Map(wallets.map(x=>[String(x.userId),x])); return success(res,{rows:rows.map(u=>({...adminPublicUser(u),subscription:sm.get(String(u._id))||null,leagueCount:em.get(String(u._id))||0,wallet:wm.get(String(u._id))||null,walletStatus:wm.has(String(u._id))?'ok':'missing',walletTotalCents:wm.has(String(u._id))?Number(wm.get(String(u._id)).availableBalanceCents||0)+Number(wm.get(String(u._id)).pendingBalanceCents||0):null})),pagination:{page,limit,total,pages:Math.ceil(total/limit)}});
 }catch(error){next(error);}});
 
 async function paidLeagueParticipantIds() {
@@ -6198,7 +6344,7 @@ app.get('/api/admin/users/:id', requireAdmin, async (req, res, next) => {
       LeagueEntry.find({ userId: req.params.id }).populate('leagueId', 'name competitionType status').sort({ joinedAt: -1 }).lean(),
       Transaction.find({ userId: req.params.id }).sort({ createdAt: -1 }).limit(200).lean(),
     ]);
-    return success(res, { user, profile, wallet, subscriptions, entries, transactions, team });
+    return success(res, { user, profile, wallet, walletStatus: wallet ? 'ok' : 'missing', subscriptions, entries, transactions, team });
   } catch (error) { next(error); }
 });
 
@@ -6479,7 +6625,7 @@ app.get('/api/admin/transactions', requireAdmin, async (req, res, next) => {
     // admin can filter the transaction table without making money disappear
     // from the headline cash/revenue figures.
 
-    const [rows, total, summary, cashIn, revenue, revenueBreakdown, payoutsDue] = await Promise.all([
+    const [rows, total, summary, cashIn, revenue, revenueBreakdown, payoutsDue, cashAccounting] = await Promise.all([
       Transaction.find(filter)
         .populate('userId', 'fullName email phone')
         .populate('leagueId', 'name')
@@ -6566,9 +6712,11 @@ app.get('/api/admin/transactions', requireAdmin, async (req, res, next) => {
           },
         },
       ]),
+      getCashAccounting(Transaction),
     ]);
 
     return success(res, {
+      cashAccounting,
       rows,
       summary,
       cashIn: {
@@ -7227,7 +7375,7 @@ const localGrowth = (() => {
 
         const leagueIds = metas.map((meta) => meta.leagueId);
         const [leagues, entries, users] = await Promise.all([
-          League.find({ _id: { $in: leagueIds } }).select('_id name status entryFeeCents').lean(),
+          League.find({ _id: { $in: leagueIds } }).select('_id name status entryFeeCents officialSupremeLeague competitionType cadence').lean(),
           LeagueEntry.find({ leagueId: { $in: leagueIds }, paymentStatus: { $in: ['paid', 'completed'] } }).select('leagueId userId').lean(),
           User.find({ role: 'user', status: 'active', email: { $exists: true, $ne: '' } }).select('_id fullName email fplManagerId').lean(),
         ]);
@@ -7268,7 +7416,7 @@ const localGrowth = (() => {
             const subs = subscriptionsByUser.get(String(user._id)) || [];
             const eligible = group.filter((meta) => {
               if (joined.has(`${user._id}:${meta.leagueId}`)) return false;
-              if (meta.entryMode === 'free-all') return Boolean(String(user.fplManagerId || '').trim());
+              if (isClashOfCaptains(meta, leagueMap.get(String(meta.leagueId)))) return Boolean(String(user.fplManagerId || '').trim());
               if (['weekly-flex', 'one-off-flex'].includes(meta.entryMode)) return true;
               return subs.some((sub) => subscriptionEntitles(sub, meta.cadence, meta));
             });
@@ -7278,12 +7426,12 @@ const localGrowth = (() => {
               const league = leagueMap.get(String(meta.leagueId));
               const access = ['weekly-flex', 'one-off-flex'].includes(meta.entryMode)
                 ? `${money(Number(league?.entryFeeCents ?? meta.entryFeeCents ?? 100))} one-off or eligible subscription`
-                : meta.entryMode === 'free-all' ? 'Free entry' : 'Included with eligible subscription';
+                : isClashOfCaptains(meta, league) ? 'Free entry' : `Paid subscription from ${money(PLANS.monthly.amountCents)}`;
               return { label: league?.name || meta.periodLabel, value: access };
             });
             rows.push({ label: 'Entry deadline', value: formattedDeadline });
 
-            const upcomingClash = eligible.some((meta) => meta.cadence === 'clash-captains') || group.some((meta) => meta.cadence === 'clash-captains');
+            const upcomingClash = eligible.some((meta) => isClashOfCaptains(meta, leagueMap.get(String(meta.leagueId))));
             const result = await sendEmail({
               eventKey: `league-join-deadline:${deadlineIso}:${reminderBucket}:${user._id}`,
               userId: user._id,
@@ -7847,7 +7995,7 @@ const localGrowth = (() => {
               'Entry closes at the official FPL gameweek deadline.',
               'The competition closes only when FPL marks the gameweek finished and every fixture is finished.',
               'Prizes are paid after FPL marks the gameweek data_checked.',
-              'If the highest Clash score is tied, the tied player with the highest cumulative FPL overall points wins the full published prize.',
+              'If Clash gameweek points tie, the tied manager with the most cumulative FPL season points wins the full published prize. A stable entry ID is the final tie-break.',
             ],
           };
         }
@@ -8060,6 +8208,8 @@ const localGrowth = (() => {
 
         const metas = await SupremeLeagueMeta.find({ settlementStatus: 'open' }).lean();
         const metaByLeague = new Map(metas.map((meta) => [String(meta.leagueId), meta]));
+        const policyLeagues = metas.length ? await League.find({ _id: { $in: metas.map(m => m.leagueId) } }).select('_id officialSupremeLeague competitionType').lean() : [];
+        const policyLeagueById = new Map(policyLeagues.map(l => [String(l._id), l]));
         const candidates = metas.length ? await LeagueEntry.find({
           leagueId: { $in: metas.map((meta) => meta.leagueId) },
           paymentStatus: 'paid',
@@ -8073,7 +8223,7 @@ const localGrowth = (() => {
         const invalidEntries = [];
         for (const entry of candidates) {
           const meta = metaByLeague.get(String(entry.leagueId));
-          if (!meta || meta.entryMode === 'free-all') continue;
+          if (!meta || isClashOfCaptains(meta, policyLeagueById.get(String(meta.leagueId)))) continue;
           const validSubscription = (verifiedByUser.get(String(entry.userId)) || []).find((subscription) => subscriptionEntitles(subscription, meta.cadence, meta));
           if (!validSubscription) invalidEntries.push(entry);
           else if (apply && (!entry.subscriptionId || entry.entrySource !== 'subscription')) {
@@ -8108,6 +8258,8 @@ const localGrowth = (() => {
         if (userId) userFilter._id = userId;
         const users = await User.find(userFilter).select('_id fplManagerId').lean();
         const userIds = users.map((user) => user._id);
+        const leagueDocs = await League.find({ _id: { $in: metas.map((meta) => meta.leagueId) } }).select('_id officialSupremeLeague competitionType').lean();
+        const enrolLeagueMap = new Map(leagueDocs.map((league) => [String(league._id), league]));
         const subscriptions = await activeSubscriptionsForUsers(userIds, now);
         const subscriptionsByUser = new Map();
         for (const sub of subscriptions) {
@@ -8118,7 +8270,7 @@ const localGrowth = (() => {
 
         for (const meta of metas) {
           for (const user of users) {
-            const isFreeForAll = meta.entryMode === 'free-all';
+            const isFreeForAll = isClashOfCaptains(meta, enrolLeagueMap.get(String(meta.leagueId)));
             const matchingSubscription = (subscriptionsByUser.get(String(user._id)) || []).find((sub) => subscriptionEntitles(sub, meta.cadence, meta)) || null;
             if (!isFreeForAll && !matchingSubscription) continue;
             const exists = await LeagueEntry.exists({ leagueId: meta.leagueId, userId: user._id });
@@ -8299,28 +8451,19 @@ const localGrowth = (() => {
           throw new Error(`Settlement paused because ${scoreFailures.length} eligible entr${scoreFailures.length === 1 ? 'y' : 'ies'} could not be scored from FPL. ${scoreFailures.slice(0, 3).join(' | ')}`);
         }
 
-        const isClash = meta.scoringMode === 'captain-vice';
+        const associatedLeague = await League.findById(meta.leagueId).select('officialSupremeLeague competitionType').lean();
+        const isClash = isClashOfCaptains(meta, associatedLeague);
         scored.sort((a, b) => {
-          const scoreDifference = Number(b.currentScore || 0) - Number(a.currentScore || 0);
-          if (scoreDifference) return scoreDifference;
-          if (isClash) {
-            // Primary contest score is captain + vice-captain GW points.
-            // First tie-break is the FPL manager's cumulative overall points.
-            const overallPointsDifference = Number(b.scoreDetails?.overallPoints || 0) - Number(a.scoreDetails?.overallPoints || 0);
-            if (overallPointsDifference) return overallPointsDifference;
-          }
-          // Stable last-resort tie-break ensures precisely one winner even if
-          // both the contest score and cumulative overall points are equal.
-          const idDifference = String(a._id).localeCompare(String(b._id));
-          if (isClash) return idDifference;
-          return new Date(a.joinedAt || 0) - new Date(b.joinedAt || 0);
+          if (isClash) return compareClashEntries(a, b);
+          return Number(b.currentScore || 0) - Number(a.currentScore || 0)
+            || new Date(a.joinedAt || 0) - new Date(b.joinedAt || 0);
         });
         let lastScore = null;
         let rank = 0;
         scored.forEach((entry, index) => {
           if (isClash) {
-            // Clash ties are explicitly broken by FPL overall rank for this
-            // gameweek, so the ordered leaderboard has a single #1.
+            // Clash ties use cumulative FPL season points and stable entry ID,
+            // giving exactly one rank #1.
             entry.currentRank = index + 1;
           } else {
             if (lastScore === null || Number(entry.currentScore) !== Number(lastScore)) rank = index + 1;
@@ -8333,8 +8476,8 @@ const localGrowth = (() => {
         const topScore = Number(scored[0].currentScore || 0);
         const tiedTopScorers = scored.filter((entry) => Number(entry.currentScore || 0) === topScore);
         // Clash of the Captains has one winner. When captain+vice scores tie,
-        // choose the tied user with the most cumulative FPL overall points
-        // (stable entry ID is the final fallback). Standard Supreme leagues keep their existing split.
+        // choose the tied manager with the highest cumulative FPL season points.
+        // Standard Supreme leagues retain their published shared-prize rule.
         const winners = isClash ? [tiedTopScorers[0]] : tiedTopScorers;
         const clashTieBreakApplied = isClash && tiedTopScorers.length > 1;
         const baseSplit = Math.floor(Number(meta.prizeCents || 0) / winners.length);
@@ -8365,7 +8508,7 @@ const localGrowth = (() => {
             title: won ? 'Congratulations — you finished on top' : 'The competition has been settled',
             tone: won ? 'success' : 'brand',
             message: won
-              ? `<p style="margin:0;">${clashTieBreakApplied ? 'You were tied on Clash score and won the tie-break with the highest cumulative FPL overall points.' : `You finished with the highest qualifying score${winners.length > 1 ? ' (tied for first)' : ''}.`} Your ${money(entry.prizeCents)} prize${winners.length > 1 ? ' share' : ''} has been credited to your Supreme wallet and is available for withdrawal.</p>`
+              ? `<p style="margin:0;">${clashTieBreakApplied ? 'You were tied on Clash score and won the tie-break with the highest cumulative FPL season points.' : `You finished with the highest qualifying score${winners.length > 1 ? ' (tied for first)' : ''}.`} Your ${money(entry.prizeCents)} prize${winners.length > 1 ? ' share' : ''} has been credited to your Supreme wallet and is available for withdrawal.</p>`
               : `<p style="margin:0;">The final result is now available. Your score and rank remain available in your league history.</p>`,
             buttonLabel: 'View final standings',
             buttonUrl: `${appUrl}/app/leagues/${meta.leagueId}`,
@@ -8373,7 +8516,7 @@ const localGrowth = (() => {
               { label: 'Competition', value: league?.name || meta.periodLabel },
               { label: 'Final rank', value: entry.currentRank || '—' },
               { label: 'Score', value: entry.currentScore || 0 },
-              ...(isClash ? [{ label: 'FPL overall rank', value: Number.isFinite(Number(entry.latestOverallRank)) && Number(entry.latestOverallRank) < Number.MAX_SAFE_INTEGER ? Number(entry.latestOverallRank).toLocaleString('en-GB') : '—' }] : []),
+              ...(isClash ? [{ label: 'Cumulative FPL points', value: Number(entry.scoreDetails?.overallPoints ?? 0).toLocaleString('en-GB') }] : []),
               { label: 'Prize share', value: won ? money(entry.prizeCents) : money(0) },
             ],
           });
@@ -8392,6 +8535,7 @@ const localGrowth = (() => {
         meta.settlementLockId = '';
         meta.settlementLockedAt = null;
         await meta.save();
+        await emailService.notifyOwnerLeagueSettlement(league, winners.length, Number(meta.prizeCents || 0));
         return { settled: true, winners: winners.length, prizeCents: meta.prizeCents, verified };
       }
 
@@ -8621,7 +8765,8 @@ const localGrowth = (() => {
               const myEntry = entryMap.get(String(meta.leagueId)) || null;
               const deadlineAt = meta.joinDeadlineAt ? new Date(meta.joinDeadlineAt) : null;
               const joined = myEntry?.paymentStatus === 'paid';
-              const oneOffPaidEntry = ['weekly-flex', 'one-off-flex'].includes(meta.entryMode) || (['weekly', 'bi-weekly'].includes(meta.cadence) && Number(league?.entryFeeCents ?? meta.entryFeeCents ?? 0) > 0);
+              const pricing = pricingForLeague(league, meta, { monthly: PLANS.monthly.amountCents, 'bi-weekly': PLANS.plus.amountCents, weekly: PLANS.halfSeason.amountCents, 'half-season': PLANS.halfSeason.amountCents, season: PLANS.season.amountCents });
+              const oneOffPaidEntry = pricing.oneOffAllowed;
               const joinOpen = Boolean(
                 oneOffPaidEntry
                 && !joined
@@ -8637,18 +8782,19 @@ const localGrowth = (() => {
                 joined,
                 joinOpen,
                 entryFeeCents: Number(league?.entryFeeCents ?? meta.entryFeeCents ?? 0),
+                ...pricing,
                 prizeCents: meta.cadence === 'clash-captains'
                   ? cents(process.env.SUPREME_CLASH_CAPTAINS_PRIZE_CENTS, 300)
                   : Number(meta.prizeCents || league?.displayedPrizeCents || 0),
                 footballFinished: Boolean(meta.finishedAt || league?.fplFinishedAt || ['awaiting-review', 'settled'].includes(league?.status)),
                 scoringFinalized: Boolean(meta.dataCheckedAt || league?.fplDataCheckedAt || meta.settlementStatus === 'settled'),
                 includedWithSubscription: Boolean(joined && /included with active subscription/i.test(myEntry?.eligibilityReason || '')),
-                freeEntry: meta.entryMode === 'free-all',
-                paymentOptions: oneOffPaidEntry ? ['subscription', 'one-off'] : (meta.entryMode === 'free-all' ? ['free'] : ['subscription']),
+                freeEntry: pricing.freeEntry,
+                paymentOptions: pricing.paymentOptions,
                 scoringMode: meta.scoringMode || 'manager-points',
                 teamLinked: Boolean(req.user.fplManagerId),
-                tieRule: meta.scoringMode === 'captain-vice'
-                  ? 'If the highest Clash score is tied, the tied player with the highest cumulative FPL overall points wins the full prize.'
+                tieRule: pricing.freeEntry
+                  ? 'Highest captain-and-vice gameweek points wins. If tied, the highest cumulative FPL season points wins; if still tied, the oldest stable entry ID wins.'
                   : 'If two or more users finish with the same highest score, the prize is split fairly among all tied winners.',
               };
             }));
@@ -8810,10 +8956,13 @@ async function runDailyMaintenanceTasks() {
   // Keep the financially important work near the front of the serverless run.
   // Provisioning, enrollment and settlement must not wait behind a potentially
   // large all-user team-sync batch; a function timeout must not strand prizes.
+  // Attempt the small email campaign batch before potentially lengthy FPL
+  // maintenance/snapshot work, so a timeout does not starve marketing emails.
+  const marketingEmails = await processMarketingCampaignBatch();
   const growth = await localGrowth.runMaintenance();
+  const engagementEmails = await localGrowth.sendScheduledUserEmails();
   const leagueSyncs = await syncActiveLeagueScores();
   const teamSnapshots = await refreshMemberTeamSnapshots();
-  const engagementEmails = await localGrowth.sendScheduledUserEmails();
   return {
     tasks: [
       'reconcile-monthly-subscription-windows',
@@ -8826,6 +8975,7 @@ async function runDailyMaintenanceTasks() {
       'sync-league-scores',
       'refresh-member-team-snapshots',
       'send-account-league-gameweek-and-subscription-reminders',
+      'send-opted-in-marketing-campaign-batch',
     ],
     monthlySubscriptions,
     walletPurchases,
@@ -8834,6 +8984,7 @@ async function runDailyMaintenanceTasks() {
     leaguesScored: leagueSyncs.length,
     teamSnapshots,
     engagementEmails,
+    marketingEmails,
     growth,
   };
 }
