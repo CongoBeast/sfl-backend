@@ -245,6 +245,23 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
     });
   }
 
+  async function notifyOwnerFailedSignup({ email, reason, attemptId }) {
+    if (!ADMIN_NOTIFICATION_EMAIL) return { skipped: true, reason: 'admin-notification-email-not-configured' };
+    return sendBrandedEmail({
+      recipientEmail: ADMIN_NOTIFICATION_EMAIL,
+      bypassPreferences: true,
+      eventType: 'operations.failed-signup',
+      dedupeKey: `operations-failed-signup:${attemptId}`,
+      subject: 'Failed Supreme registration attempt',
+      eyebrow: 'Registration issue',
+      title: 'A signup attempt was unsuccessful',
+      intro: 'A registration request did not complete successfully.',
+      content: detailRows([{ label: 'Email', value: email || '(not provided)' }, { label: 'Reason', value: reason || 'Unknown' }]),
+      actionLabel: 'Open admin',
+      actionUrl: appLink('/admin'),
+    });
+  }
+
   async function notifyOwnerUserSignup(user) {
     if (!ADMIN_NOTIFICATION_EMAIL) return { skipped: true, reason: 'admin-notification-email-not-configured' };
     return sendBrandedEmail({
@@ -814,6 +831,7 @@ ${footerNote ? `<p style="margin:24px 0 0;padding-top:20px;border-top:1px solid 
     notifyWelcome: safeNotification('notifyWelcome', notifyWelcome),
     notifyAdminWelcome: safeNotification('notifyAdminWelcome', notifyAdminWelcome),
     notifyOwnerUserSignup: safeNotification('notifyOwnerUserSignup', notifyOwnerUserSignup),
+    notifyOwnerFailedSignup: safeNotification('notifyOwnerFailedSignup', notifyOwnerFailedSignup),
     notifyOwnerAdminSignup: safeNotification('notifyOwnerAdminSignup', notifyOwnerAdminSignup),
     notifyPaymentUpdate: safeNotification('notifyPaymentUpdate', notifyPaymentUpdate),
     notifyOwnerWithdrawalRequest: safeNotification('notifyOwnerWithdrawalRequest', notifyOwnerWithdrawalRequest),

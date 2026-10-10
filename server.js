@@ -2362,8 +2362,8 @@ async function isFreeForAllLeague(league) {
   if (!league?.officialSupremeLeague) return false;
   const SupremeLeagueMetaModel = mongoose.models.SupremeLeagueMeta;
   if (!SupremeLeagueMetaModel) return false;
-  const meta = await SupremeLeagueMetaModel.findOne({ leagueId: league._id }).select('entryMode').lean();
-  return meta?.entryMode === 'free-all';
+  const meta = await SupremeLeagueMetaModel.findOne({ leagueId: league._id }).select('entryMode cadence').lean();
+  return meta?.entryMode === 'free-all' && meta?.cadence === 'clash-captains' && league.competitionType === 'clash-captains';
 }
 
 async function leagueView(league, userId = null) {
@@ -2599,7 +2599,18 @@ function normalizedMarketingAttribution(raw = {}) {
   };
 }
 
-app.post('/api/auth/register', authLimiter, async (req, res, next) => {
+app.post('/api/auth/register', authLimiter, (req, res, next) => {
+  // Observe validation/database failures without logging credentials or full request bodies.
+  res.once('finish', () => {
+    if (res.statusCode < 400) return;
+    emailService.notifyOwnerFailedSignup({
+      email: normalizeEmail(req.body?.email || '').slice(0, 120),
+      reason: `Registration returned HTTP ${res.statusCode}`,
+      attemptId: createReference('SIGNUP-FAILED'),
+    }).catch((error) => console.error('Signup failure alert:', error.message));
+  });
+  next();
+}, async (req, res, next) => {
   try {
     const { fullName, email, phone, dateOfBirth, password, confirmPassword, ageConfirmed, termsAccepted, privacyAccepted, rulesAccepted, securityAcknowledged } = req.body;
     const errors = [];
@@ -2619,10 +2630,8 @@ app.post('/api/auth/register', authLimiter, async (req, res, next) => {
       .trim()
       .toUpperCase()
       .replace(/[^A-Z0-9]/g, '');
-    if (referralCode) {
-      const referralExists = await localGrowth.models.ReferralAccount.exists({ code: referralCode });
-      if (!referralExists) return failure(res, 400, 'The referral code is not valid. Check the code and try again.');
-    }
+    // Referral codes are always optional. An invalid optional code must not block registration.
+    const validReferralCode = referralCode && await localGrowth.models.ReferralAccount.exists({ code: referralCode }) ? referralCode : '';
 
     const passwordHash = await bcrypt.hash(password, 12);
     const acceptedAt = new Date();
@@ -2650,7 +2659,7 @@ app.post('/api/auth/register', authLimiter, async (req, res, next) => {
     setSessionCookie(res, token);
     await logAudit(req, 'auth.register', 'User', user._id, null, { email: user.email, termsVersion: LEGAL_TERMS_VERSION, privacyVersion: LEGAL_PRIVACY_VERSION, rulesVersion: LEGAL_RULES_VERSION }, 'User registration and legal acceptance');
     await Promise.all([emailService.notifyWelcome(user), emailService.notifyOwnerUserSignup(user)]);
-    await localGrowth.ensureReferralAccount(user, referralCode);
+    await localGrowth.ensureReferralAccount(user, validReferralCode);
     return success(res, { user: publicUser(user, profile) }, 201);
   } catch (error) { next(error); }
 });
@@ -5459,6 +5468,30 @@ function nextAdminBucket(date, groupBy) {
   return new Date(value.getTime() + (groupBy === 'week' ? 7 : 1) * 86400000);
 }
 
+// External funds are counted once on the successfully completed payment ledger.
+// Internal wallet entry fees/prizes are not additional external inflows/outflows.
+async function getAdminCashAccounting() {
+  const now = new Date();
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const lastMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+  const moneyTransactions = await Transaction.aggregate([
+    { $match: { status: 'completed', $or: [
+      { type: { $in: ['deposit', 'subscription', 'entry-fee'] }, provider: 'paynow', direction: 'credit' },
+      { type: 'withdrawal', direction: 'debit' },
+    ] } },
+    { $project: { amountCents: 1, type: 1, date: { $ifNull: ['$metadata.paidAt', { $ifNull: ['$metadata.finalizedAt', '$updatedAt'] }] }, isPayout: { $eq: ['$type', 'withdrawal'] } } },
+    { $group: { _id: { payout: '$isPayout', period: { $cond: [{ $gte: ['$date', monthStart] }, 'current', { $cond: [{ $gte: ['$date', lastMonthStart] }, 'previous', 'older'] }] } }, cents: { $sum: '$amountCents' }, count: { $sum: 1 } } },
+  ]);
+  const result = { lifetime: { collectedCents: 0, paidOutCents: 0 }, thisMonth: { collectedCents: 0, paidOutCents: 0 }, lastMonth: { collectedCents: 0, paidOutCents: 0 } };
+  for (const bucket of moneyTransactions) {
+    const key = bucket._id.payout ? 'paidOutCents' : 'collectedCents';
+    result.lifetime[key] += bucket.cents;
+    if (bucket._id.period === 'current') result.thisMonth[key] += bucket.cents;
+    if (bucket._id.period === 'previous') result.lastMonth[key] += bucket.cents;
+  }
+  return result;
+}
+
 async function getAdminDashboardAnalytics(req) {
   const { from, toExclusive } = parseAdminAnalyticsRange(req);
   const groupBy = ['day', 'week', 'month'].includes(String(req.query.groupBy || '').toLowerCase())
@@ -5731,7 +5764,7 @@ app.get('/api/admin/session', requireAdmin, (req, res) => success(res, { admin: 
 app.get('/api/admin/dashboard', requireAdmin, async (req, res, next) => {
   try {
     const monthStart = new Date(); monthStart.setUTCDate(1); monthStart.setUTCHours(0, 0, 0, 0);
-    const [users, newUsers, activeSubscriptions, usersInLeagues, leagueGroups, activeLeagues, finance, openTickets, analytics] = await Promise.all([
+    const [users, newUsers, activeSubscriptions, usersInLeagues, leagueGroups, activeLeagues, finance, openTickets, analytics, cashAccounting, recentTransactions] = await Promise.all([
       User.countDocuments({ role: 'user' }),
       User.countDocuments({ role: 'user', createdAt: { $gte: monthStart } }),
       Subscription.countDocuments({ status: 'active' }),
@@ -5741,6 +5774,8 @@ app.get('/api/admin/dashboard', requireAdmin, async (req, res, next) => {
       Transaction.aggregate([{ $match: { status: 'completed' } }, { $group: { _id: { type: '$type', direction: '$direction', provider: '$provider' }, amountCents: { $sum: '$amountCents' }, count: { $sum: 1 } } }]),
       SupportTicket.countDocuments({ status: { $nin: ['resolved', 'closed'] } }),
       getAdminDashboardAnalytics(req),
+      getAdminCashAccounting(),
+      Transaction.find({ type: { $in: ['deposit', 'subscription', 'entry-fee', 'withdrawal'] } }).sort({ createdAt: -1 }).limit(10).populate('userId', 'fullName email').select('type status amountCents createdAt direction provider userId reference').lean(),
     ]);
     const payoutsDueCents = await Transaction.aggregate([
       { $match: { type: { $in: ['withdrawal', 'prize'] }, status: { $in: ['pending', 'processing'] } } },
@@ -5764,6 +5799,8 @@ app.get('/api/admin/dashboard', requireAdmin, async (req, res, next) => {
         breakdown: finance,
       },
       analytics,
+      cashAccounting,
+      recentTransactions,
       openTickets,
     });
   } catch (error) { next(error); }
@@ -7810,7 +7847,7 @@ const localGrowth = (() => {
               'Entry closes at the official FPL gameweek deadline.',
               'The competition closes only when FPL marks the gameweek finished and every fixture is finished.',
               'Prizes are paid after FPL marks the gameweek data_checked.',
-              'If the highest Clash score is tied, the tied player with the best FPL overall rank for that gameweek wins the full published prize.',
+              'If the highest Clash score is tied, the tied player with the highest cumulative FPL overall points wins the full published prize.',
             ],
           };
         }
@@ -8147,6 +8184,7 @@ const localGrowth = (() => {
             gameweek: Number(gameweek),
             overallRank: Number(picks.entryHistory?.overall_rank || 0),
             gameweekRank: Number(picks.entryHistory?.rank || 0),
+            overallPoints: Number(picks.entryHistory?.total_points ?? 0),
             captain: { elementId: captain.elementId, name: captain.name, club: captain.club, points: Number(captain.points || 0) },
             viceCaptain: { elementId: viceCaptain.elementId, name: viceCaptain.name, club: viceCaptain.club, points: Number(viceCaptain.points || 0) },
           },
@@ -8266,11 +8304,15 @@ const localGrowth = (() => {
           const scoreDifference = Number(b.currentScore || 0) - Number(a.currentScore || 0);
           if (scoreDifference) return scoreDifference;
           if (isClash) {
-            const overallRankDifference = Number(a.latestOverallRank || Number.MAX_SAFE_INTEGER) - Number(b.latestOverallRank || Number.MAX_SAFE_INTEGER);
-            if (overallRankDifference) return overallRankDifference;
-            const gameweekRankDifference = Number(a.scoreDetails?.gameweekRank || Number.MAX_SAFE_INTEGER) - Number(b.scoreDetails?.gameweekRank || Number.MAX_SAFE_INTEGER);
-            if (gameweekRankDifference) return gameweekRankDifference;
+            // Primary contest score is captain + vice-captain GW points.
+            // First tie-break is the FPL manager's cumulative overall points.
+            const overallPointsDifference = Number(b.scoreDetails?.overallPoints || 0) - Number(a.scoreDetails?.overallPoints || 0);
+            if (overallPointsDifference) return overallPointsDifference;
           }
+          // Stable last-resort tie-break ensures precisely one winner even if
+          // both the contest score and cumulative overall points are equal.
+          const idDifference = String(a._id).localeCompare(String(b._id));
+          if (isClash) return idDifference;
           return new Date(a.joinedAt || 0) - new Date(b.joinedAt || 0);
         });
         let lastScore = null;
@@ -8291,8 +8333,8 @@ const localGrowth = (() => {
         const topScore = Number(scored[0].currentScore || 0);
         const tiedTopScorers = scored.filter((entry) => Number(entry.currentScore || 0) === topScore);
         // Clash of the Captains has one winner. When captain+vice scores tie,
-        // choose the tied user with the best (lowest) FPL overall rank recorded
-        // for that gameweek. Standard Supreme leagues keep their existing split.
+        // choose the tied user with the most cumulative FPL overall points
+        // (stable entry ID is the final fallback). Standard Supreme leagues keep their existing split.
         const winners = isClash ? [tiedTopScorers[0]] : tiedTopScorers;
         const clashTieBreakApplied = isClash && tiedTopScorers.length > 1;
         const baseSplit = Math.floor(Number(meta.prizeCents || 0) / winners.length);
@@ -8323,7 +8365,7 @@ const localGrowth = (() => {
             title: won ? 'Congratulations — you finished on top' : 'The competition has been settled',
             tone: won ? 'success' : 'brand',
             message: won
-              ? `<p style="margin:0;">${clashTieBreakApplied ? 'You were tied on Clash score and won the tie-break with the best FPL overall rank for the gameweek.' : `You finished with the highest qualifying score${winners.length > 1 ? ' (tied for first)' : ''}.`} Your ${money(entry.prizeCents)} prize${winners.length > 1 ? ' share' : ''} has been credited to your Supreme wallet and is available for withdrawal.</p>`
+              ? `<p style="margin:0;">${clashTieBreakApplied ? 'You were tied on Clash score and won the tie-break with the highest cumulative FPL overall points.' : `You finished with the highest qualifying score${winners.length > 1 ? ' (tied for first)' : ''}.`} Your ${money(entry.prizeCents)} prize${winners.length > 1 ? ' share' : ''} has been credited to your Supreme wallet and is available for withdrawal.</p>`
               : `<p style="margin:0;">The final result is now available. Your score and rank remain available in your league history.</p>`,
             buttonLabel: 'View final standings',
             buttonUrl: `${appUrl}/app/leagues/${meta.leagueId}`,
@@ -8606,7 +8648,7 @@ const localGrowth = (() => {
                 scoringMode: meta.scoringMode || 'manager-points',
                 teamLinked: Boolean(req.user.fplManagerId),
                 tieRule: meta.scoringMode === 'captain-vice'
-                  ? 'If the highest Clash score is tied, the tied player with the best FPL overall rank for that gameweek wins the full prize.'
+                  ? 'If the highest Clash score is tied, the tied player with the highest cumulative FPL overall points wins the full prize.'
                   : 'If two or more users finish with the same highest score, the prize is split fairly among all tied winners.',
               };
             }));
